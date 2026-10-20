@@ -1,0 +1,59 @@
+# Dependencies
+node_modules/
+**/node_modules/
+.pnp
+.pnp.js
+
+# Next.js / Web
+.next/
+**/.next/
+out/
+build/
+dist/
+
+# TypeScript
+*.tsbuildinfo
+next-env.d.ts
+
+# Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+*.egg-info/
+*.egg
+
+# Database / Storage
+*.sqlite3
+*.db
+uploads/
+
+# Environment variables & local configs
+.env
+.env*.local
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Operating System & IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
