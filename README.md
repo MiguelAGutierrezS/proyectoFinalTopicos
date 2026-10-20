@@ -117,7 +117,7 @@ Luego abre tu navegador en **[http://localhost:3000](http://localhost:3000)**.
 ## 📂 Estructura del Proyecto (SDD)
 
 ```text
-├── .cursorrules                         # Reglas de arquitectura SDD y stack obligatorio
+├── .gemini                              # Reglas de arquitectura SDD y stack obligatorio
 ├── specs/                               # Fuente Única de Verdad (Especificaciones SDD)
 │   ├── 01-requirements-ears.md          # Requisitos funcionales en formato EARS
 │   ├── 02-database-and-api.md           # Esquema SQLite (4 tablas) y contratos REST API
