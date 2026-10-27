@@ -47,11 +47,15 @@ export interface ChatSummary {
   created_at: string;
   updated_at: string;
   message_count: number;
+  is_context_compacted?: boolean;
 }
 
 export interface ChatDetail {
   id: string;
   title: string;
+  context_summary?: string | null;
+  compacted_up_to_index?: number | null;
+  is_context_compacted?: boolean;
   created_at: string;
   updated_at: string;
   user_message_count: number;

@@ -21,6 +21,14 @@
 5. **Modo de Satisfacción A/B (Aprendizaje de Estilo)**:
    - Se activa automáticamente **cada 3 mensajes del usuario** o manualmente con el botón **"Comparar 2 respuestas"**.
    - Genera **Respuesta A (Enfoque Directo / Conciso)** (`temperature=0.3`) y **Respuesta B (Enfoque Detallado / Explicativo)** (`temperature=0.8`) lado a lado para que elijas cuál prefieres, guardando tu preferencia en la tabla `user_preferences` para adaptar futuras respuestas.
+6. **Context Compactor (Estilo Claude Code)**:
+   - Gestión inteligente del historial largo en chats de muchos turnos. Cuando la conversación supera el umbral configurable (`COMPACTION_THRESHOLD = 14` o `TOKEN_BUDGET = 3200` tokens), el sistema genera un resumen técnico acumulativo de los turnos antiguos con Ollama (`temp=0.2`) y lo inyecta como memoria compactada, evitando desbordar la ventana de contexto de modelos locales.
+7. **Prompt Enhancer Determinista**:
+   - Clasificación instantánea de intención (código, datos, conceptos, comparación, etc.) e inyección de contexto de sesión estructurado sin llamadas adicionales a LLM (cero latencia agregada).
+8. **Experiencia de Usuario Moderna**:
+   - **Drag & Drop Multimodal**: Arrastra fotos, PDFs, CSVs o audios directamente sobre el compositor con un overlay visual interactivo.
+   - **Edición Inline de Títulos**: Doble clic o botón de edición en cualquier chat de la barra lateral para renombrarlo al instante.
+   - **Syntax Highlighting & Botón Copiar**: Bloques de código con coloreado de sintaxis (`oneDark`), números de línea y botón para copiar al portapapeles con confirmación visual.
 
 ---
 

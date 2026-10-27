@@ -340,6 +340,7 @@ async def send_message(
         user_message_count=user_msg_count,
         requested_model=model,
         compare_mode=should_compare,
+        chat=chat,
     )
 
     # 5. Guardar la respuesta del asistente en SQLite

@@ -59,7 +59,7 @@ interface SpeechRecognitionInstance {
 const ACCEPTED_EXTENSIONS =
   ".png,.jpg,.jpeg,.webp,.pdf,.txt,.csv,.md,.mp3,.wav,.m4a,.ogg";
 
-function getFileCategory(file: File): "image" | "document" | "audio" {
+function getFileCategory(file: File): "image" | "document" | "audio" | null {
   const ext = file.name.split(".").pop()?.toLowerCase() || "";
   if (["png", "jpg", "jpeg", "webp"].includes(ext) || file.type.startsWith("image/")) {
     return "image";
@@ -67,7 +67,13 @@ function getFileCategory(file: File): "image" | "document" | "audio" {
   if (["mp3", "wav", "m4a", "ogg"].includes(ext) || file.type.startsWith("audio/")) {
     return "audio";
   }
-  return "document";
+  if (
+    ["pdf", "txt", "csv", "md"].includes(ext) ||
+    ["application/pdf", "text/plain", "text/csv", "text/markdown"].includes(file.type)
+  ) {
+    return "document";
+  }
+  return null;
 }
 
 function formatFileSize(bytes: number): string {
@@ -88,6 +94,7 @@ export default function MultimodalInputBar({
   const [isListening, setIsListening] = useState(false);
   const [interimTranscript, setInterimTranscript] = useState("");
   const [voiceWarning, setVoiceWarning] = useState<string | null>(null);
+  const [isDraggingOver, setIsDraggingOver] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -122,6 +129,12 @@ export default function MultimodalInputBar({
         return;
       }
       const category = getFileCategory(file);
+      if (!category) {
+        setVoiceWarning(
+          `El formato de "${file.name}" no está permitido. Formatos soportados: fotos (.png, .jpg, .webp), documentos (.pdf, .txt, .csv, .md) o audios (.mp3, .wav, .m4a, .ogg).`
+        );
+        return;
+      }
       const previewUrl =
         category === "image" ? URL.createObjectURL(file) : undefined;
       newItems.push({
@@ -289,17 +302,55 @@ export default function MultimodalInputBar({
         </div>
       )}
 
-      {/* Contenedor estilo cápsula de Google Gemini (#1e1f20) */}
+      {/* Contenedor estilo cápsula de Google Gemini (#1e1f20) con soporte Drag & Drop */}
       <form
         onSubmit={handleSubmit}
-        className={`rounded-3xl bg-[#1e1f20] border transition-all shadow-lg ${
-          isListening
+        onDragOver={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          setIsDraggingOver(true);
+        }}
+        onDragEnter={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          setIsDraggingOver(true);
+        }}
+        onDragLeave={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+            setIsDraggingOver(false);
+          }
+        }}
+        onDrop={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          setIsDraggingOver(false);
+          handleFilesSelected(e.dataTransfer.files);
+        }}
+        className={`relative rounded-3xl bg-[#1e1f20] border transition-all shadow-lg ${
+          isDraggingOver
+            ? "border-[#4b90ff] shadow-blue-500/20 ring-2 ring-[#4b90ff]/30"
+            : isListening
             ? "border-red-500/70 shadow-red-500/10"
             : compareMode
             ? "border-purple-500/60 shadow-purple-500/10"
             : "border-[#333537] focus-within:border-[#4b90ff]/70"
         }`}
       >
+        {/* Overlay interactivo al arrastrar archivos (REQ-UI-04) */}
+        {isDraggingOver && (
+          <div className="absolute inset-0 z-30 flex flex-col items-center justify-center rounded-3xl bg-[#131314]/92 border-2 border-dashed border-[#4b90ff] pointer-events-none backdrop-blur-sm animate-in fade-in duration-150">
+            <div className="w-12 h-12 rounded-2xl bg-gradient-to-tr from-[#4b90ff]/30 to-[#a855f7]/30 flex items-center justify-center mb-2 shadow-lg shadow-blue-500/20">
+              <Plus className="w-6 h-6 text-[#4b90ff]" />
+            </div>
+            <p className="text-sm font-semibold text-white">Suelta aquí tus archivos</p>
+            <p className="text-xs text-[#9aa0a6] mt-0.5">
+              Fotos, PDF, CSV, TXT, MD o Audios (máx 25 MB)
+            </p>
+          </div>
+        )}
+
         {/* Previsualización de archivos adjuntos (chips arriba del input antes de enviar) */}
         {attachedItems.length > 0 && (
           <div className="flex flex-wrap gap-2 px-4 pt-3.5 pb-1">

@@ -21,6 +21,7 @@ import Sidebar from "@/components/Sidebar";
 import ABComparisonSelector from "@/components/ABComparisonSelector";
 import FollowUpOptions from "@/components/FollowUpOptions";
 import MultimodalInputBar from "@/components/MultimodalInputBar";
+import { geminiMarkdownComponents } from "@/lib/markdownComponents";
 import {
   CandidateChoice,
   ChatSummary,
@@ -37,6 +38,7 @@ import {
   getAttachmentUrl,
   selectABCandidate,
   sendMessage,
+  updateChatTitle,
 } from "@/lib/api";
 
 /**
@@ -222,6 +224,22 @@ export default function HomePage() {
     }
   };
 
+  // Renombrar un chat existente en SQLite (REQ-UI-01)
+  const handleRenameChat = async (chatId: string, newTitle: string) => {
+    setErrorBanner(null);
+    try {
+      await updateChatTitle(chatId, newTitle);
+      const updatedList = await fetchChats();
+      setChats(updatedList);
+    } catch (err) {
+      setErrorBanner(
+        err instanceof Error
+          ? err.message
+          : "No se pudo actualizar el título del chat."
+      );
+    }
+  };
+
   // Enviar mensaje (desde barra inferior, clic en opción de seguimiento o botón regenerar A/B)
   const handleSendUserMessage = async ({
     content,
@@ -383,6 +401,7 @@ export default function HomePage() {
         onSelectChat={handleSelectChat}
         onNewChat={handleNewChat}
         onDeleteChat={handleDeleteChat}
+        onRenameChat={handleRenameChat}
         models={models}
         selectedModel={selectedModel}
         onSelectModel={setSelectedModel}
@@ -655,9 +674,12 @@ export default function HomePage() {
                               </div>
                             )}
 
-                            {/* Contenido Markdown */}
+                            {/* Contenido Markdown con Syntax Highlighting (REQ-UI-05) */}
                             <div className="gemini-markdown text-sm sm:text-[15px] text-[#e3e3e3]">
-                              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                              <ReactMarkdown
+                                remarkPlugins={[remarkGfm]}
+                                components={geminiMarkdownComponents}
+                              >
                                 {msg.content}
                               </ReactMarkdown>
                             </div>

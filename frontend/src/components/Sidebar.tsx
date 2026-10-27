@@ -5,6 +5,7 @@ import {
   Plus,
   MessageSquare,
   Trash2,
+  Edit3,
   Cpu,
   SplitSquareHorizontal,
   Sparkles,
@@ -20,6 +21,7 @@ export interface SidebarProps {
   onSelectChat: (chatId: string) => void;
   onNewChat: () => void;
   onDeleteChat: (chatId: string) => void;
+  onRenameChat?: (chatId: string, newTitle: string) => Promise<void>;
   models: OllamaModelInfo[];
   selectedModel: string;
   onSelectModel: (modelName: string) => void;
@@ -38,6 +40,7 @@ export default function Sidebar({
   onSelectChat,
   onNewChat,
   onDeleteChat,
+  onRenameChat,
   models,
   selectedModel,
   onSelectModel,
@@ -49,6 +52,23 @@ export default function Sidebar({
   onToggleSidebar,
   isLoadingChats = false,
 }: SidebarProps) {
+  const [editingChatId, setEditingChatId] = React.useState<string | null>(null);
+  const [editingTitle, setEditingTitle] = React.useState<string>("");
+
+  const handleStartRename = (chat: ChatSummary, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    setEditingChatId(chat.id);
+    setEditingTitle(chat.title);
+  };
+
+  const handleConfirmRename = async (chatId: string, originalTitle: string) => {
+    const trimmed = editingTitle.trim();
+    setEditingChatId(null);
+    if (!trimmed || trimmed === originalTitle) return;
+    if (onRenameChat) {
+      await onRenameChat(chatId, trimmed);
+    }
+  };
   if (!isOpen) {
     return (
       <aside className="flex flex-col items-center justify-between py-4 px-2 bg-[#1e1f20] border-r border-[#333537]/80 w-16 shrink-0 h-screen select-none transition-all duration-200">
@@ -189,23 +209,73 @@ export default function Sidebar({
                       isSelected ? "text-[#4b90ff]" : "text-[#9aa0a6]"
                     }`}
                   />
-                  <span className="truncate text-xs sm:text-sm" title={chat.title}>
-                    {chat.title || "Nuevo Chat"}
-                  </span>
+
+                  {editingChatId === chat.id ? (
+                    <input
+                      autoFocus
+                      type="text"
+                      value={editingTitle}
+                      maxLength={100}
+                      onClick={(e) => e.stopPropagation()}
+                      onChange={(e) => setEditingTitle(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          void handleConfirmRename(chat.id, chat.title);
+                        } else if (e.key === "Escape") {
+                          setEditingChatId(null);
+                        }
+                      }}
+                      onBlur={() => void handleConfirmRename(chat.id, chat.title)}
+                      className="flex-1 bg-[#131314] text-xs sm:text-sm text-white px-2 py-0.5 rounded border border-[#4b90ff] focus:outline-none"
+                    />
+                  ) : (
+                    <div className="flex items-center gap-1.5 min-w-0 flex-1">
+                      <span
+                        className="truncate text-xs sm:text-sm flex-1 select-none"
+                        title={`${chat.title || "Nuevo Chat"} (Doble clic para renombrar)`}
+                        onDoubleClick={(e) => handleStartRename(chat, e)}
+                      >
+                        {chat.title || "Nuevo Chat"}
+                      </span>
+                      {chat.is_context_compacted && (
+                        <span
+                          title="Memoria compactada activa (Context Compactor)"
+                          className="shrink-0 text-[10px] px-1.5 py-0.2 rounded-full bg-blue-500/15 border border-blue-500/30 text-blue-300 font-mono"
+                        >
+                          🧠
+                        </span>
+                      )}
+                    </div>
+                  )}
                 </div>
 
-                <button
-                  type="button"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onDeleteChat(chat.id);
-                  }}
-                  title="Eliminar este chat"
-                  aria-label={`Eliminar chat ${chat.title}`}
-                  className="opacity-70 group-hover:opacity-100 p-1.5 rounded-lg text-[#9aa0a6] hover:text-red-400 hover:bg-red-500/15 transition-colors shrink-0"
-                >
-                  <Trash2 className="w-3.5 h-3.5" />
-                </button>
+                {editingChatId !== chat.id && (
+                  <div className="flex items-center gap-0.5 shrink-0">
+                    <button
+                      type="button"
+                      onClick={(e) => handleStartRename(chat, e)}
+                      title="Renombrar este chat"
+                      aria-label={`Renombrar chat ${chat.title}`}
+                      className="opacity-0 group-hover:opacity-80 hover:opacity-100 p-1.5 rounded-lg text-[#9aa0a6] hover:text-[#4b90ff] hover:bg-blue-500/15 transition-all"
+                    >
+                      <Edit3 className="w-3.5 h-3.5" />
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onDeleteChat(chat.id);
+                      }}
+                      title="Eliminar este chat"
+                      aria-label={`Eliminar chat ${chat.title}`}
+                      className="opacity-60 group-hover:opacity-100 p-1.5 rounded-lg text-[#9aa0a6] hover:text-red-400 hover:bg-red-500/15 transition-colors"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                )}
               </div>
             );
           })

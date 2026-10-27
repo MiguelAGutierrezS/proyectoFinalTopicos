@@ -13,6 +13,7 @@ import {
   Loader2,
 } from "lucide-react";
 import { CandidateChoice, Message } from "@/lib/api";
+import { geminiMarkdownComponents } from "@/lib/markdownComponents";
 
 export interface ABComparisonSelectorProps {
   message: Message;
@@ -121,7 +122,10 @@ export default function ABComparisonSelector({
             </div>
 
             <div className="gemini-markdown text-sm text-[#e3e3e3] max-h-[380px] overflow-y-auto pr-1">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+              <ReactMarkdown
+                remarkPlugins={[remarkGfm]}
+                components={geminiMarkdownComponents}
+              >
                 {candidateA}
               </ReactMarkdown>
             </div>
@@ -193,7 +197,10 @@ export default function ABComparisonSelector({
             </div>
 
             <div className="gemini-markdown text-sm text-[#e3e3e3] max-h-[380px] overflow-y-auto pr-1">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+              <ReactMarkdown
+                remarkPlugins={[remarkGfm]}
+                components={geminiMarkdownComponents}
+              >
                 {candidateB}
               </ReactMarkdown>
             </div>

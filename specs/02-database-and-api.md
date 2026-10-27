@@ -21,6 +21,8 @@ erDiagram
     chats {
         TEXT id PK "UUID v4"
         TEXT title "Título del chat"
+        TEXT context_summary "Resumen compactado del historial antiguo (NULL si no aplica)"
+        INTEGER compacted_up_to_index "Índice del último mensaje incluido en el resumen"
         DATETIME created_at "UTC timestamp"
         DATETIME updated_at "UTC timestamp"
     }
@@ -66,6 +68,8 @@ Almacena las sesiones de conversación.
 CREATE TABLE IF NOT EXISTS chats (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL DEFAULT 'Nuevo Chat',
+    context_summary TEXT DEFAULT NULL,         -- Resumen compactado del historial antiguo (NULL = no compactado aún)
+    compacted_up_to_index INTEGER DEFAULT NULL, -- Índice (orden creado_at ASC) del último mensaje incluido en el resumen
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );

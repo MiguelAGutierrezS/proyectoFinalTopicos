@@ -1,5 +1,6 @@
 import logging
 import os
+from pathlib import Path
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -8,7 +9,30 @@ import httpx
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from models import Message, UserPreference
+# Cargar automáticamente .env si existe
+_env_backend = Path(__file__).resolve().parent.parent / ".env"
+_env_root = Path(__file__).resolve().parent.parent.parent / ".env"
+try:
+    from dotenv import load_dotenv
+    if _env_backend.exists():
+        load_dotenv(dotenv_path=_env_backend)
+    elif _env_root.exists():
+        load_dotenv(dotenv_path=_env_root)
+    else:
+        load_dotenv()
+except ImportError:
+    for _cand in (_env_backend, _env_root):
+        if _cand.exists():
+            with open(_cand, "r", encoding="utf-8") as _f:
+                for _line in _f:
+                    _line = _line.strip()
+                    if _line and not _line.startswith("#") and "=" in _line:
+                        _k, _v = _line.split("=", 1)
+                        _k, _v = _k.strip(), _v.strip().strip("\"'")
+                        if _k and _k not in os.environ:
+                            os.environ[_k] = _v
+
+from models import Chat, Message, UserPreference
 from services.multimodal_processor import ProcessedAttachment, load_image_as_base64
 
 logger = logging.getLogger(__name__)
@@ -17,6 +41,13 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip(
 DEFAULT_FALLBACK_MODEL = os.getenv("OLLAMA_DEFAULT_MODEL", "llama3.2:latest")
 MAX_HISTORY_MESSAGES = 10
 FOLLOW_UP_SEPARATOR = "---FOLLOW_UP_OPTIONS---"
+
+# Parámetros del Context Compactor (estilo Claude Code, configurables vía .env)
+COMPACTION_THRESHOLD = int(os.getenv("COMPACTION_THRESHOLD", "14"))
+TOKEN_BUDGET = int(os.getenv("TOKEN_BUDGET", "3200"))
+RECENT_WINDOW_AFTER_COMPACTION = int(os.getenv("RECENT_WINDOW_AFTER_COMPACTION", "4"))
+COMPACTOR_TEMPERATURE = float(os.getenv("COMPACTOR_TEMPERATURE", "0.2"))
+COMPACTOR_MODEL = os.getenv("COMPACTOR_MODEL", "").strip() or None
 
 # Regex tolerante a variaciones que suelen producir modelos pequeños o antiguos
 SEPARATOR_REGEX = re.compile(
@@ -154,6 +185,143 @@ def build_style_instruction_from_preferences(db: Session) -> str:
     return (
         "PREFERENCIA DE ESTILO: Utiliza un estilo equilibrado, claro, amigable y bien estructurado en Markdown."
     )
+
+
+# =====================================================================
+# 2.1. Prompt Enhancer Determinista (specs/03-ai-orchestration.md §6)
+# =====================================================================
+
+
+def classify_intent(user_text: str, has_attachments: bool) -> str:
+    """
+    Clasifica la intención del usuario de forma 100% determinista (sin llamadas a LLM),
+    utilizando análisis léxico y contexto multimodal según specs/03-ai-orchestration.md §6.3.
+    """
+    text_lower = (user_text or "").lower()
+
+    if any(
+        kw in text_lower
+        for kw in (
+            "código",
+            "codigo",
+            "función",
+            "funcion",
+            "implementa",
+            "escribe",
+            "crea una clase",
+            "bug",
+            "error",
+            "script",
+            "algoritmo",
+            "sql",
+            "query",
+            "endpoint",
+            "fastapi",
+            "react",
+            "typescript",
+            "python",
+        )
+    ):
+        return "GENERACIÓN_DE_CÓDIGO"
+
+    if has_attachments or any(
+        kw in text_lower
+        for kw in (
+            "archivo",
+            "documento",
+            "pdf",
+            "csv",
+            "tabla",
+            "datos",
+            "analiza",
+            "resume",
+            "estadística",
+            "estadistica",
+            "reporte",
+            "ventas",
+        )
+    ):
+        return "ANÁLISIS_DE_DATOS"
+
+    if any(
+        kw in text_lower
+        for kw in (
+            "vs",
+            "versus",
+            "diferencias",
+            "ventajas",
+            "compara",
+            "elige entre",
+            "cuál es mejor",
+            "cual es mejor",
+        )
+    ):
+        return "COMPARACIÓN"
+
+    if any(
+        kw in text_lower
+        for kw in (
+            "qué es",
+            "que es",
+            "explícame",
+            "explicame",
+            "cómo funciona",
+            "como funciona",
+            "diferencia entre",
+            "define",
+            "por qué",
+            "por que",
+        )
+    ):
+        return "EXPLICACIÓN_CONCEPTUAL"
+
+    if any(
+        kw in text_lower
+        for kw in (
+            "traduce",
+            "en inglés",
+            "en ingles",
+            "en francés",
+            "en frances",
+            "idioma",
+            "traducción",
+            "traduccion",
+        )
+    ):
+        return "TRADUCCIÓN_O_IDIOMA"
+
+    return "GENERAL"
+
+
+def enhance_user_prompt(
+    user_text: str,
+    user_message_count: int,
+    has_attachments: bool,
+    dominant_style: str,
+) -> str:
+    """
+    Enriquece el mensaje del usuario con contexto estructurado de sesión
+    para maximizar la precisión de modelos locales pequeños sin latencia adicional (specs/03 §6).
+    """
+    clean_text = (user_text or "").strip()
+    if not clean_text and has_attachments:
+        clean_text = "Analiza los archivos adjuntos y extrae los puntos principales."
+
+    intent = classify_intent(clean_text, has_attachments)
+    style_label = {
+        "concise": "CONCISO (preferencia aprendida)",
+        "detailed": "DETALLADO (preferencia aprendida)",
+        "balanced": "EQUILIBRADO",
+    }.get(dominant_style, "EQUILIBRADO")
+
+    attachment_note = " | Adjuntos en este turno: Sí" if has_attachments else ""
+    context_block = (
+        f"[CONTEXTO DE SESIÓN]\n"
+        f"Turno de usuario #{user_message_count} | Estilo preferido: {style_label}{attachment_note}\n"
+        f"Intención detectada: {intent}\n"
+        f"{'─' * 40}\n\n"
+    )
+    return f"{context_block}{clean_text}"
 
 
 # =====================================================================
@@ -361,22 +529,135 @@ def format_user_message_with_attachments(
     return "\n".join(blocks).strip()
 
 
+def estimate_history_tokens(messages: List[Message]) -> int:
+    """Estima la cantidad de tokens acumulados en el historial (heurística: ~4 caracteres por token)."""
+    total_chars = sum(len(m.content or "") for m in messages)
+    for m in messages:
+        if m.attachments:
+            total_chars += sum(len(a.extracted_text or "") for a in m.attachments)
+    return total_chars // 4
+
+
+async def compact_chat_history(
+    db: Session,
+    chat: Optional[Chat],
+    history_messages: List[Message],
+    active_model: str,
+) -> Optional[str]:
+    """
+    Context Compactor inspirado en Claude Code (specs/03-ai-orchestration.md §5).
+    Si el historial supera COMPACTION_THRESHOLD o TOKEN_BUDGET, resume los turnos
+    antiguos con Ollama y persiste el resumen técnico en chats.context_summary.
+    """
+    if not chat:
+        return None
+
+    if len(history_messages) < COMPACTION_THRESHOLD:
+        return chat.context_summary
+
+    est_tokens = estimate_history_tokens(history_messages)
+    if len(history_messages) < COMPACTION_THRESHOLD and est_tokens < TOKEN_BUDGET:
+        return chat.context_summary
+
+    cutoff_index = max(0, len(history_messages) - RECENT_WINDOW_AFTER_COMPACTION)
+    messages_to_compact = history_messages[:cutoff_index]
+    if not messages_to_compact:
+        return chat.context_summary
+
+    history_lines: List[str] = []
+    if chat.context_summary:
+        history_lines.append(f"[Resumen previo acumulado]:\n{chat.context_summary}\n")
+
+    history_lines.append("[Turnos a compactar]:")
+    for msg in messages_to_compact:
+        role_label = "Usuario" if msg.role == "user" else "Asistente"
+        snippet = (msg.content or "").strip()
+        if len(snippet) > 600:
+            snippet = f"{snippet[:600]}..."
+        history_lines.append(f"- {role_label}: {snippet}")
+
+    history_block = "\n".join(history_lines)
+
+    compactor_system = (
+        "Eres un asistente de resumen técnico para compactación de contexto en LLMs locales.\n"
+        "Tu misión es resumir la conversación en español preservando:\n"
+        "1. Temas principales discutidos (máximo 5 puntos clave concisos).\n"
+        "2. Datos técnicos concretos (nombres de archivos, tecnologías, decisiones tomadas).\n"
+        "3. El contexto acumulado necesario para los próximos turnos.\n\n"
+        "Reglas estrictas:\n"
+        "- Máximo 300 palabras.\n"
+        "- NO incluyas saludos ni frases de cortesía.\n"
+        "- NO incluyas el separador ---FOLLOW_UP_OPTIONS---.\n"
+        "- Responde únicamente con el resumen técnico estructurado."
+    )
+
+    payload_messages = [
+        {"role": "system", "content": compactor_system},
+        {
+            "role": "user",
+            "content": f"Compacta el siguiente historial de conversación:\n\n{history_block}",
+        },
+    ]
+
+    try:
+        logger.info(
+            "Ejecutando Context Compactor para el chat '%s' (%d mensajes a compactar, ~%d tokens estimados)...",
+            chat.id,
+            len(messages_to_compact),
+            est_tokens,
+        )
+        model_to_use = COMPACTOR_MODEL or active_model
+        compacted_summary = await call_ollama_chat(
+            model_name=model_to_use,
+            messages=payload_messages,
+            temperature=COMPACTOR_TEMPERATURE,
+        )
+        cleaned_summary, _ = parse_response_and_options(compacted_summary, "resumen")
+        cleaned_summary = cleaned_summary.strip()
+
+        if cleaned_summary and not cleaned_summary.startswith("⚠️"):
+            chat.context_summary = cleaned_summary
+            chat.compacted_up_to_index = cutoff_index
+            db.commit()
+            db.refresh(chat)
+            logger.info("Context Compactor guardado exitosamente para el chat '%s'.", chat.id)
+            return cleaned_summary
+
+    except Exception as exc:
+        logger.warning("Error en Context Compactor para el chat '%s': %s", chat.id, exc)
+
+    return chat.context_summary
+
+
 def build_ollama_messages_history(
     history_messages: List[Message],
     current_user_content: str,
     current_attachments: List[ProcessedAttachment],
     system_prompt: str,
+    context_summary: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Construye la lista de mensajes para el payload `/api/chat` de Ollama,
-    incluyendo hasta `MAX_HISTORY_MESSAGES` mensajes previos del chat.
+    Construye la lista de mensajes para el payload `/api/chat` de Ollama.
+    Si context_summary está presente, inyecta la memoria compactada en el rol system
+    y conserva solo los turnos recientes (RECENT_WINDOW_AFTER_COMPACTION).
     """
     ollama_messages: List[Dict[str, Any]] = [
         {"role": "system", "content": system_prompt}
     ]
 
-    # Tomar los últimos mensajes previos (excluyendo el recién insertado si ya viene en la lista)
-    recent_history = history_messages[-MAX_HISTORY_MESSAGES:]
+    if context_summary and context_summary.strip():
+        ollama_messages.append({
+            "role": "system",
+            "content": (
+                "[MEMORIA COMPACTADA DE CONVERSACIÓN PREVIA — Claude Code style]\n"
+                f"{context_summary.strip()}\n"
+                "[FIN DE MEMORIA COMPACTADA — los mensajes siguientes corresponden a los turnos recientes]"
+            ),
+        })
+        recent_history = history_messages[-RECENT_WINDOW_AFTER_COMPACTION:]
+    else:
+        recent_history = history_messages[-MAX_HISTORY_MESSAGES:]
+
     for msg in recent_history:
         msg_text = (msg.content or "").strip()
         if msg.role == "user" and msg.attachments:
@@ -561,9 +842,12 @@ async def generate_assistant_reply(
     user_message_count: int,
     requested_model: Optional[str] = None,
     compare_mode: bool = False,
+    chat: Optional[Chat] = None,
 ) -> OrchestrationResult:
     """
     Orquesta la generación de la respuesta de la IA local:
+    - Activa Context Compactor si la conversación supera COMPACTION_THRESHOLD / TOKEN_BUDGET (Claude Code style).
+    - Aplica Prompt Enhancer determinista con detección de intención y perfil de sesión.
     - Determina si debe activarse el Modo de Satisfacción A/B:
       `should_run_ab = compare_mode or (user_message_count > 0 and user_message_count % 3 == 0)`
     - En modo normal: Inyecta la preferencia histórica del usuario (`user_preferences`) y genera 1 respuesta + 3 opciones.
@@ -605,6 +889,27 @@ async def generate_assistant_reply(
             model_used=requested_model or DEFAULT_FALLBACK_MODEL,
         )
 
+    # 1. Context Compactor (estilo Claude Code): resumir turnos antiguos si se supera el presupuesto
+    context_summary = None
+    if ollama_reachable and active_model and chat:
+        context_summary = await compact_chat_history(
+            db=db,
+            chat=chat,
+            history_messages=history_messages,
+            active_model=active_model,
+        )
+    elif chat and chat.context_summary:
+        context_summary = chat.context_summary
+
+    # 2. Prompt Enhancer Determinista (specs/03-ai-orchestration.md §6):
+    user_pref = get_user_style_preference(db)
+    enhanced_user_content = enhance_user_prompt(
+        user_text=user_content,
+        user_message_count=user_message_count,
+        has_attachments=has_attachments,
+        dominant_style=user_pref["dominant_style"],
+    )
+
     # Caso 2: Modo de Comparación A/B (cada 3 mensajes del usuario o compare_mode=True)
     if should_run_ab:
         directive_a = (
@@ -624,15 +929,17 @@ async def generate_assistant_reply(
 
         messages_a = build_ollama_messages_history(
             history_messages=history_messages,
-            current_user_content=user_content,
+            current_user_content=enhanced_user_content,
             current_attachments=processed_attachments,
             system_prompt=build_system_prompt(directive_a),
+            context_summary=context_summary,
         )
         messages_b = build_ollama_messages_history(
             history_messages=history_messages,
-            current_user_content=user_content,
+            current_user_content=enhanced_user_content,
             current_attachments=processed_attachments,
             system_prompt=build_system_prompt(directive_b),
+            context_summary=context_summary,
         )
 
         # Llamadas secuenciales para no saturar la CPU/GPU local en Ollama
@@ -670,12 +977,12 @@ async def generate_assistant_reply(
     system_prompt = build_system_prompt(learned_style_directive)
     ollama_messages = build_ollama_messages_history(
         history_messages=history_messages,
-        current_user_content=user_content,
+        current_user_content=enhanced_user_content,
         current_attachments=processed_attachments,
         system_prompt=system_prompt,
+        context_summary=context_summary,
     )
 
-    user_pref = get_user_style_preference(db)
     temp = 0.4 if user_pref["dominant_style"] == "concise" else 0.7
 
     raw_reply = await call_ollama_chat(

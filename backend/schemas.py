@@ -151,6 +151,10 @@ class ChatSummaryResponse(BaseModel):
     created_at: datetime = Field(..., description="Fecha de creación UTC")
     updated_at: datetime = Field(..., description="Fecha de última actualización UTC")
     message_count: int = Field(default=0, description="Total de mensajes en el chat")
+    is_context_compacted: bool = Field(
+        default=False,
+        description="True si el chat posee memoria histórica compactada",
+    )
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -160,6 +164,18 @@ class ChatDetailResponse(BaseModel):
 
     id: str = Field(..., description="UUID v4 del chat")
     title: str = Field(..., description="Título del chat")
+    context_summary: Optional[str] = Field(
+        default=None,
+        description="Resumen técnico compactado del historial antiguo (estilo Claude Code)",
+    )
+    compacted_up_to_index: Optional[int] = Field(
+        default=None,
+        description="Índice del último mensaje compactado",
+    )
+    is_context_compacted: bool = Field(
+        default=False,
+        description="True si este chat ha sido compactado",
+    )
     created_at: datetime = Field(..., description="Fecha de creación UTC")
     updated_at: datetime = Field(..., description="Fecha de última actualización UTC")
     user_message_count: int = Field(

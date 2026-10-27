@@ -204,3 +204,208 @@ Para las respuestas normales (cuando `is_ab_test == False`), el orquestador cons
 - Si el usuario tiene más selecciones de tipo `"detailed"`, se inyecta:
   `"Preferencia aprendida del usuario: El usuario prefiere respuestas DETALLADAS, estructuradas y con ejemplos explicativos."`
 - Si aún no hay registros en `user_preferences` (o hay empate), se utiliza un estilo equilibrado por defecto.
+
+---
+
+## 5. Context Compactor — Gestión Inteligente del Historial Largo
+
+> **Versión:** 1.1.0 — Inspirado en el mecanismo de compactación de Claude Code.  
+> **Problema resuelto:** El truncado ciego de `MAX_HISTORY_MESSAGES = 10` elimina contexto crítico en chats largos. El compactor preserva la esencia de toda la conversación en un resumen inyectado como contexto del sistema.
+
+### 5.1 Cuándo se activa y Configuración vía `.env`
+
+El Context Compactor se activa **antes de construir el payload hacia Ollama** cuando se cumplen AMBAS condiciones:
+
+1. El chat tiene más de `COMPACTION_THRESHOLD` mensajes totales (usuario + asistente), Y
+2. El tamaño estimado del historial en tokens supera `TOKEN_BUDGET` tokens (estimado como `total_chars / 4`).
+
+Todos los parámetros son configurables libremente a través de variables de entorno en el archivo `.env`:
+
+| Variable de Entorno | Valor por Defecto | Descripción |
+| :--- | :--- | :--- |
+| `COMPACTION_THRESHOLD` | `14` | Mensajes mínimos en el chat para evaluar la compactación |
+| `TOKEN_BUDGET` | `3200` | Umbral de tokens estimados del historial antes de disparar el resumen |
+| `RECENT_WINDOW_AFTER_COMPACTION` | `4` | Cantidad de turnos recientes que se preservan íntegros tras compactar |
+| `COMPACTOR_TEMPERATURE` | `0.2` | Temperatura baja para resumen determinista y sin alucinaciones |
+| `COMPACTOR_MODEL` | *(vacío)* | Modelo opcional exclusivo para compactar (ej. `llama3.2:1b`). Si se omite, usa el modelo activo |
+
+> **Nota de compatibilidad con hardware local:** El umbral por defecto de 3200 tokens deja margen seguro para el system prompt (~400 tokens), el mensaje actual del usuario (~500 tokens) y la respuesta del modelo (~2000 tokens), considerando que la mayoría de modelos en Ollama local usa `num_ctx = 4096`.
+
+### 5.2 Algoritmo de Compactación
+
+```mermaid
+flowchart TD
+    A["generate_assistant_reply() llamado"] --> B{"¿Historial supera\nCOMPACTION_THRESHOLD\ny TOKEN_BUDGET?"}
+    B -- No --> G["Flujo normal\n(últimos 10 mensajes)"]
+    B -- Sí --> C["Seleccionar mensajes ANTIGUOS\npara compactar\n(todos excepto los últimos 4)"]
+    C --> D["¿chat.context_summary ya existe?"]
+    D -- Sí --> E["Combinar resumen previo\n+ mensajes nuevos a compactar"]
+    D -- No --> E2["Usar solo mensajes a compactar"]
+    E --> F["Llamar a Ollama con\nPROMPT_COMPACTOR\n(temp=0.2, modelo liviano)"]
+    E2 --> F
+    F --> H["Guardar nuevo resumen\nen chats.context_summary\ny actualizar compacted_up_to_index"]
+    H --> I["Construir historial final:\n[RESUMEN como mensaje system]\n+ últimos 4 mensajes reales"]
+    I --> G
+```
+
+### 5.3 Prompt de Compactación (`PROMPT_COMPACTOR`)
+
+El prompt que se envía a Ollama para generar el resumen del historial antiguo:
+
+```text
+TAREA DE COMPACTACIÓN DE CONTEXTO:
+Eres un asistente de resumen técnico. A continuación encontrarás el historial de una conversación entre un usuario y un asistente de IA.
+
+Tu misión es generar un resumen compacto en español que preserve:
+1. Los temas principales discutidos (máximo 5 bullets).
+2. Cualquier dato técnico específico mencionado (nombres de archivos, errores concretos, decisiones tomadas).
+3. El contexto acumulado que el asistente necesita para responder coherentemente en los próximos turnos.
+
+IMPORTANTE:
+- NO incluyas saludos, metadiálogos ni frases de cortesía.
+- Máximo 400 palabras.
+- Formato: texto plano estructurado (sin Markdown).
+- NO incluyas ---FOLLOW_UP_OPTIONS--- en tu respuesta.
+
+HISTORIAL A COMPACTAR:
+{history_block}
+```
+
+### 5.4 Inyección del Resumen en el Historial
+
+Cuando el compactor ha generado un `context_summary`, el historial enviado a Ollama se construye así:
+
+```python
+# Estructura del payload messages[] hacia Ollama tras compactación:
+[
+  {"role": "system", "content": "<SYSTEM_PROMPT_NORMAL>"},
+  {"role": "system", "content": (
+      "[RESUMEN DE CONVERSACIÓN PREVIA — generado automáticamente]\n"
+      f"{chat.context_summary}\n"
+      "[FIN DEL RESUMEN — los mensajes siguientes son los más recientes]"
+  )},
+  # últimos 4 mensajes reales (los más recientes, NO compactados)
+  {"role": "user",      "content": "..."},
+  {"role": "assistant", "content": "..."},
+  {"role": "user",      "content": "..."},
+  {"role": "assistant", "content": "..."},
+  # mensaje actual del usuario:
+  {"role": "user", "content": "<mensaje_actual_con_adjuntos>"}
+]
+```
+
+### 5.5 Persistencia del Resumen en SQLite
+
+El resumen se persiste en la tabla `chats` (campos añadidos en `specs/02-database-and-api.md`):
+
+| Campo | Tipo | Descripción |
+|-------|------|-------------|
+| `context_summary` | `TEXT DEFAULT NULL` | Texto del resumen generado por Ollama |
+| `compacted_up_to_index` | `INTEGER DEFAULT NULL` | Posición del último mensaje incluido en el resumen (para re-compactaciones incrementales) |
+
+**Migración de base de datos existente:** Al arrancar, `init_db()` ejecuta automáticamente `ALTER TABLE IF NOT EXISTS` para añadir las columnas si `localgem.db` ya existe, sin destruir datos.
+
+### 5.6 Respuestas de la API afectadas
+
+`GET /api/chats/{chat_id}` añade al response:
+```json
+{
+  "id": "...",
+  "title": "...",
+  "context_summary": "El usuario discutió la arquitectura limpia con FastAPI...",
+  "is_context_compacted": true,
+  "messages": [...]
+}
+```
+
+---
+
+## 6. Prompt Enhancer — Enriquecimiento Determinista de Mensajes
+
+> **Versión:** 1.1.0  
+> **Objetivo:** Transformar el mensaje crudo del usuario en un prompt semánticamente enriquecido que mejore la calidad de las respuestas de modelos pequeños, **sin llamadas extra a Ollama** (100% determinista, cero latencia adicional).
+
+### 6.1 Qué es y qué NO es
+
+| ✅ Es | ❌ NO es |
+|-------|---------|
+| Análisis heurístico del texto del usuario | Llamada extra a un LLM para reformular |
+| Inyección de contexto de sesión estructurado | JSON Schema forzado en Ollama (incompatible con modelos pequeños) |
+| Enriquecimiento del mensaje antes de enviarlo a Ollama | Modificación visible del mensaje en la UI |
+| Mejora de calidad sin overhead de latencia | Replacement completo del mensaje original |
+
+### 6.2 Estructura del Mensaje Enriquecido
+
+La función `enhance_user_prompt()` añade un bloque de contexto estructurado **antes** del mensaje del usuario, sin modificar el contenido original:
+
+```text
+[CONTEXTO DE SESIÓN]
+Turno de usuario #7 en este chat | Estilo preferido aprendido: CONCISO | Adjuntos en este turno: 1 PDF
+Intención detectada: ANÁLISIS DE DATOS
+──────────────────────────────────────
+
+Dame un resumen de las ventas del Q3 del archivo adjunto
+```
+
+### 6.3 Clasificador de Intención Determinista
+
+La función `classify_intent(user_text: str, has_attachments: bool) -> str` clasifica el mensaje en una de estas 6 categorías usando regex y keywords sin IA:
+
+| Intención | Keywords / Patrones detectados | Ejemplo de mensaje |
+|-----------|-------------------------------|-------------------|
+| `GENERACIÓN_DE_CÓDIGO` | `código`, `función`, `implementa`, `escribe`, `crea una clase`, `bug`, `error` | "Escríbeme una función que..." |
+| `ANÁLISIS_DE_DATOS` | Adjunto CSV/PDF + `analiza`, `resume`, `compara`, `gráfico`, `estadística` | "Analiza este CSV de ventas" |
+| `EXPLICACIÓN_CONCEPTUAL` | `qué es`, `explícame`, `cómo funciona`, `diferencia entre`, `define` | "¿Qué es Clean Architecture?" |
+| `COMPARACIÓN` | `vs`, `versus`, `diferencias`, `ventajas`, `compara`, `elige entre` | "SQLite vs PostgreSQL para..." |
+| `TRADUCCIÓN_O_IDIOMA` | `traduce`, `en inglés`, `en francés`, `idioma` | "Traduce esto al inglés" |
+| `GENERAL` | Cualquier otro mensaje | Cualquier consulta libre |
+
+### 6.4 Implementación de `enhance_user_prompt()`
+
+```python
+def enhance_user_prompt(
+    user_text: str,
+    user_message_count: int,
+    has_attachments: bool,
+    dominant_style: str,   # "concise" | "detailed" | "balanced"
+) -> str:
+    """
+    Enriquece el mensaje del usuario con contexto de sesión estructurado
+    para mejorar la coherencia y calidad de modelos locales pequeños.
+    No realiza ninguna llamada a Ollama. Puramente determinista.
+    """
+    intent = classify_intent(user_text, has_attachments)
+    style_label = {
+        "concise": "CONCISO (preferencia aprendida)",
+        "detailed": "DETALLADO (preferencia aprendida)",
+        "balanced": "EQUILIBRADO (sin preferencia aún)",
+    }.get(dominant_style, "EQUILIBRADO")
+
+    attachment_note = f" | Adjuntos: {has_attachments and 'Sí' or 'No'}"
+
+    context_block = (
+        f"[CONTEXTO DE SESIÓN]\n"
+        f"Turno de usuario #{user_message_count} | Estilo: {style_label}{attachment_note}\n"
+        f"Intención detectada: {intent}\n"
+        f"{'─' * 40}\n\n"
+    )
+    return context_block + user_text.strip()
+```
+
+### 6.5 Integración en el Orquestador Principal
+
+`enhance_user_prompt()` se llama **dentro de `generate_assistant_reply()`** justo antes de construir `build_ollama_messages_history()`, reemplazando `user_content` por la versión enriquecida:
+
+```python
+# En generate_assistant_reply():
+enriched_content = enhance_user_prompt(
+    user_text=user_content,
+    user_message_count=user_message_count,
+    has_attachments=has_attachments,
+    dominant_style=get_user_style_preference(db)["dominant_style"],
+)
+# Se usa enriched_content en lugar de user_content para construir el payload
+```
+
+> **Nota:** El mensaje que se guarda en SQLite (`messages.content`) sigue siendo el texto **original** del usuario, no la versión enriquecida. La UI siempre muestra el mensaje limpio; el enriquecimiento es solo para Ollama.
+

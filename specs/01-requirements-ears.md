@@ -79,3 +79,20 @@ Este documento define los requisitos funcionales y no funcionales de **LocalGem 
 | **REQ-AB-04** | State-Driven | **MIENTRAS** un mensaje con `is_ab_test = true` no tenga un `selected_candidate` elegido (`NULL`), el sistema deberá mostrar en el frontend una vista comparativa lado a lado (en escritorio) o apilada (en móvil) con ambas tarjetas (**Respuesta A — Concisa** vs **Respuesta B — Detallada**) y un botón **"Prefiero esta respuesta"** en cada una. |
 | **REQ-AB-05** | Event-Driven | **CUANDO** el usuario seleccione su candidata preferida (`"A"` o `"B"`), el sistema deberá: (1) actualizar `messages.selected_candidate` con `"A"` o `"B"`, (2) establecer `messages.content` con el texto de la candidata ganadora, (3) registrar la preferencia en la tabla `user_preferences` (`preferred_style = "concise"` para A o `"detailed"` para B, vinculada a `message_id`), y (4) mostrar las opciones de seguimiento correspondientes. |
 | **REQ-AB-06** | Ubiquitous | El sistema deberá consultar las preferencias históricas de `user_preferences` para adaptar el tono por defecto de las respuestas estándar (no A/B) al estilo favorito del usuario (`concise` o `detailed`). |
+
+---
+
+## 7. Nuevos Requisitos de Interfaz y Experiencia (`REQ-UI`)
+
+> **Versión:** 1.1.0 — Añadidos tras análisis de brechas entre especificación e implementación (2026-10-27).
+
+| ID | Tipo EARS | Especificación del Requisito |
+| :--- | :--- | :--- |
+| **REQ-UI-01** | Event-Driven | **CUANDO** el usuario haga doble clic sobre el título de un chat en la barra lateral izquierda, el sistema deberá convertir el texto en un campo de texto editable (`<input>`) inline, permitiendo modificar el título y confirmarlo con `Enter` o perder el foco (`blur`), invocando `PATCH /api/chats/{chat_id}` con el nuevo título. |
+| **REQ-UI-02** | Unwanted Behavior | **SI** el usuario deja el campo de edición de título vacío o con solo espacios en blanco y confirma, **ENTONCES** el sistema deberá revertir el título al valor anterior sin llamar al backend. |
+| **REQ-UI-03** | Event-Driven | **CUANDO** el usuario arrastre y suelte (`drag-and-drop`) uno o más archivos válidos sobre el área del compositor de mensajes (`MultimodalInputBar`), el sistema deberá comportarse exactamente igual que si hubiera seleccionado esos archivos mediante el botón `+`, mostrando los chips de previsualización y rechazando los archivos no permitidos o que superen 25 MB. |
+| **REQ-UI-04** | State-Driven | **MIENTRAS** el usuario arrastra archivos sobre el compositor, el sistema deberá mostrar un indicador visual de zona de destino activa (borde resaltado en azul/púrpura con mensaje "Suelta aquí tus archivos") que desaparece al soltar o al alejar el cursor. |
+| **REQ-UI-05** | Ubiquitous | El sistema deberá aplicar **syntax highlighting** a todos los bloques de código ` ``` ` dentro de las respuestas de la IA, usando la librería `react-syntax-highlighter` con un tema oscuro compatible con el diseño (ej. `oneDark` o `atomDark`), diferenciando visualmente el lenguaje del bloque cuando el modelo lo especifique. |
+| **REQ-UI-06** | Event-Driven | **CUANDO** el usuario haga clic en el botón **"Copiar"** que aparece al hacer hover sobre cualquier bloque de código en una respuesta de la IA, el sistema deberá copiar el contenido del bloque al portapapeles (`navigator.clipboard.writeText`) y mostrar un estado visual de confirmación ("¡Copiado!") durante 2 segundos. |
+| **REQ-UI-07** | Ubiquitous | El sistema deberá incluir un archivo `README.md` en la raíz del repositorio con instrucciones claras de instalación, prerrequisitos (Python 3.10+, Node.js 18+, Ollama, ffmpeg) y cómo arrancar el proyecto con `start-localgem.bat` (Windows) o `start-localgem.sh` (Unix). |
+

@@ -10,6 +10,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     Text,
 )
 from sqlalchemy.orm import relationship
@@ -31,13 +32,15 @@ class Chat(Base):
     """
     Tabla `chats`: Almacena las sesiones de conversación.
     Campos exactos según specs/02-database-and-api.md:
-    - id, title, created_at, updated_at
+    - id, title, context_summary, compacted_up_to_index, created_at, updated_at
     """
 
     __tablename__ = "chats"
 
     id = Column(Text, primary_key=True, default=generate_uuid)
     title = Column(Text, nullable=False, default="Nuevo Chat")
+    context_summary = Column(Text, nullable=True, default=None)
+    compacted_up_to_index = Column(Integer, nullable=True, default=None)
     created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now)
     updated_at = Column(
         DateTime(timezone=True),
@@ -65,6 +68,11 @@ class Chat(Base):
         if not self.messages:
             return 0
         return sum(1 for msg in self.messages if msg.role == "user")
+
+    @property
+    def is_context_compacted(self) -> bool:
+        """Indica si este chat posee un resumen de contexto compactado."""
+        return bool(self.context_summary and self.context_summary.strip())
 
 
 class Message(Base):

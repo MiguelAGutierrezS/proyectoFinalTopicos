@@ -1,8 +1,32 @@
 import os
+from pathlib import Path
 from typing import Generator
 from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
+
+# Cargar automáticamente .env si existe en backend/ o en la raíz
+_backend_env = Path(__file__).resolve().parent / ".env"
+_root_env = Path(__file__).resolve().parent.parent / ".env"
+try:
+    from dotenv import load_dotenv
+    if _backend_env.exists():
+        load_dotenv(dotenv_path=_backend_env)
+    elif _root_env.exists():
+        load_dotenv(dotenv_path=_root_env)
+    else:
+        load_dotenv()
+except ImportError:
+    for candidate in (_backend_env, _root_env):
+        if candidate.exists():
+            with open(candidate, "r", encoding="utf-8") as _f:
+                for _line in _f:
+                    _line = _line.strip()
+                    if _line and not _line.startswith("#") and "=" in _line:
+                        _k, _v = _line.split("=", 1)
+                        _k, _v = _k.strip(), _v.strip().strip("\"'")
+                        if _k and _k not in os.environ:
+                            os.environ[_k] = _v
 
 # Configuración apuntando al archivo local sqlite:///./localgem.db
 SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./localgem.db")
@@ -37,7 +61,22 @@ def get_db() -> Generator[Session, None, None]:
 
 
 def init_db() -> None:
-    """Importa los modelos ORM y crea automáticamente todas las tablas en localgem.db si no existen."""
+    """Importa los modelos ORM y crea automáticamente todas las tablas en localgem.db si no existen,
+    aplicando migración idempotente para columnas nuevas si la base de datos ya existía."""
     import models  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
+
+    # Migración defensiva en SQLite para columnas de Context Compactor
+    try:
+        with engine.connect() as conn:
+            cursor = conn.exec_driver_sql("PRAGMA table_info(chats)").fetchall()
+            col_names = {row[1] for row in cursor}
+            if "context_summary" not in col_names:
+                conn.exec_driver_sql("ALTER TABLE chats ADD COLUMN context_summary TEXT DEFAULT NULL")
+            if "compacted_up_to_index" not in col_names:
+                conn.exec_driver_sql("ALTER TABLE chats ADD COLUMN compacted_up_to_index INTEGER DEFAULT NULL")
+            conn.commit()
+    except Exception as exc:
+        import logging
+        logging.getLogger("localgem.db").warning("Aviso durante migración de tabla chats: %s", exc)
