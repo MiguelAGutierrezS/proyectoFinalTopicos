@@ -293,20 +293,17 @@ def classify_intent(user_text: str, has_attachments: bool) -> str:
     return "GENERAL"
 
 
-def enhance_user_prompt(
+def build_session_context_directive(
     user_text: str,
     user_message_count: int,
     has_attachments: bool,
     dominant_style: str,
 ) -> str:
     """
-    Enriquece el mensaje del usuario con contexto estructurado de sesión
-    para maximizar la precisión de modelos locales pequeños sin latencia adicional (specs/03 §6).
+    Construye una directiva técnica de sesión para inyectar en el System Prompt
+    (specs/03-ai-orchestration.md §6). Evita alterar el contenido directo del usuario.
     """
     clean_text = (user_text or "").strip()
-    if not clean_text and has_attachments:
-        clean_text = "Analiza los archivos adjuntos y extrae los puntos principales."
-
     intent = classify_intent(clean_text, has_attachments)
     style_label = {
         "concise": "CONCISO (preferencia aprendida)",
@@ -314,14 +311,28 @@ def enhance_user_prompt(
         "balanced": "EQUILIBRADO",
     }.get(dominant_style, "EQUILIBRADO")
 
-    attachment_note = " | Adjuntos en este turno: Sí" if has_attachments else ""
-    context_block = (
-        f"[CONTEXTO DE SESIÓN]\n"
-        f"Turno de usuario #{user_message_count} | Estilo preferido: {style_label}{attachment_note}\n"
-        f"Intención detectada: {intent}\n"
-        f"{'─' * 40}\n\n"
+    attachment_note = " (con archivos adjuntos)" if has_attachments else ""
+    return (
+        f"CONTEXTO DE SESIÓN:\n"
+        f"- Turno del usuario en este chat: #{user_message_count}\n"
+        f"- Estilo preferido del usuario: {style_label}{attachment_note}\n"
+        f"- Intención detectada en la consulta: {intent}"
     )
-    return f"{context_block}{clean_text}"
+
+
+def enhance_user_prompt(
+    user_text: str,
+    user_message_count: int,
+    has_attachments: bool,
+    dominant_style: str,
+) -> str:
+    """
+    Retorna el texto limpio del usuario sin decoradores que confundan a modelos pequeños o de código.
+    """
+    clean_text = (user_text or "").strip()
+    if not clean_text and has_attachments:
+        return "Analiza los archivos adjuntos y explica su contenido en detalle."
+    return clean_text
 
 
 # =====================================================================
@@ -421,6 +432,7 @@ def parse_response_and_options(
 ) -> Tuple[str, List[str]]:
     """
     Separa la respuesta limpia de las opciones de seguimiento ubicadas tras `---FOLLOW_UP_OPTIONS---`.
+    Utiliza rsplit para evitar cortes prematuros si el modelo repite texto meta.
     Si el modelo local olvida el separador o genera menos de 2 opciones válidas,
     completa automáticamente hasta tener exactamente 3 opciones contextuales.
     """
@@ -431,18 +443,60 @@ def parse_response_and_options(
     text = raw_text.strip()
     extracted_options: List[str] = []
     main_content = text
+    raw_options_block = ""
 
+    # Usar rsplit para partir en la ÚLTIMA ocurrencia del separador
     if FOLLOW_UP_SEPARATOR in text:
-        parts = text.split(FOLLOW_UP_SEPARATOR, 1)
-        main_content = parts[0].strip()
-        raw_options_block = parts[1].strip()
-    else:
-        match = SEPARATOR_REGEX.search(text)
-        if match:
-            main_content = text[: match.start()].strip()
-            raw_options_block = text[match.end() :].strip()
-        else:
+        parts = text.rsplit(FOLLOW_UP_SEPARATOR, 1)
+        cand_main = parts[0].strip()
+        cand_opts = parts[1].strip()
+
+        # Si lo que hay antes del separador es trivial o una repetición de recordatorio
+        # y lo que hay después tiene contenido sustancial, el separador estaba al inicio
+        if len(cand_main) < 25 and len(cand_opts) > 40:
+            main_content = cand_opts
             raw_options_block = ""
+        else:
+            main_content = cand_main
+            raw_options_block = cand_opts
+    else:
+        matches = list(SEPARATOR_REGEX.finditer(text))
+        if matches:
+            last_match = matches[-1]
+            cand_main = text[: last_match.start()].strip()
+            cand_opts = text[last_match.end() :].strip()
+            if len(cand_main) < 25 and len(cand_opts) > 40:
+                main_content = cand_opts
+                raw_options_block = ""
+            else:
+                main_content = cand_main
+                raw_options_block = cand_opts
+
+    # Limpiar posibles regurgitaciones de frases meta en main_content
+    main_content = re.sub(
+        r"\(?\s*Recuerda incluir al final de tu respuesta.*?seguida de 3 opciones.*?\)?",
+        "",
+        main_content,
+        flags=re.IGNORECASE | re.DOTALL,
+    ).strip()
+
+    # Si main_content sigue empezando con variantes truncadas del recordatorio, removerlas
+    main_content = re.sub(
+        r"^\(?\s*Recuerda incluir al final de tu respuesta[^\n]*\n?",
+        "",
+        main_content,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    # Si tras la limpieza el contenido quedó vacío o truncado (< 15 caracteres),
+    # generar una respuesta contextual para que la UI nunca muestre texto roto
+    if len(main_content) < 15:
+        topic = extract_topic_snippet(user_prompt)
+        main_content = (
+            f"### Análisis sobre: {topic.capitalize()}\n\n"
+            f"El modelo ha procesado tu consulta sobre **{topic}**. "
+            "A continuación puedes profundizar en los detalles utilizando las opciones de seguimiento."
+        )
 
     if raw_options_block:
         for raw_line in raw_options_block.splitlines():
@@ -473,34 +527,35 @@ def parse_response_and_options(
 # =====================================================================
 
 
-def build_system_prompt(style_directive: str) -> str:
-    """Construye el System Prompt completo incluyendo la regla obligatoria de `---FOLLOW_UP_OPTIONS---`."""
-    return (
+def build_system_prompt(style_directive: str, session_directive: Optional[str] = None) -> str:
+    """Construye el System Prompt completo incluyendo la directiva de sesión y la regla obligatoria de `---FOLLOW_UP_OPTIONS---`."""
+    parts = [
         "Eres LocalGem, un asistente de inteligencia artificial multimodal 100% local, "
-        "inspirado en Google Gemini. Respondes siempre en español claro, preciso y bien formateado en Markdown.\n\n"
-        f"{style_directive}\n\n"
+        "inspirado en Google Gemini. Respondes siempre en español claro, preciso y bien formateado en Markdown."
+    ]
+    if session_directive:
+        parts.append(session_directive)
+    parts.append(style_directive)
+    parts.append(
         "REGLA OBLIGATORIA DE OPCIONES DE SEGUIMIENTO:\n"
-        "Al final de CADA respuesta, después de terminar tu explicación principal, DEBES escribir "
-        f"en una línea nueva exactamente el separador:\n{FOLLOW_UP_SEPARATOR}\n"
-        "Y justo debajo escribe 3 opciones cortas (una por línea, sin viñetas ni numeración, máximo 75 caracteres) "
-        "que el usuario pueda hacer clic para continuar la conversación.\n\n"
-        "Ejemplo del formato final obligatorio:\n"
-        "Espero que esta información te sea de utilidad.\n\n"
+        "Primero desarrolla tu respuesta completa y natural a la consulta del usuario.\n"
+        "Únicamente al final de tu respuesta, en una línea nueva separada, escribe exactamente:\n"
         f"{FOLLOW_UP_SEPARATOR}\n"
-        "Explícame esto paso a paso\n"
-        "Dame un ejemplo práctico\n"
-        "¿Qué alternativas existen?"
+        "Y justo debajo escribe 3 opciones cortas (una por línea, sin viñetas ni numeración, máximo 75 caracteres) "
+        "que el usuario pueda hacer clic para continuar la conversación."
     )
+    return "\n\n".join(parts)
 
 
 def format_user_message_with_attachments(
     content: str,
     attachments_info: List[Dict[str, str]],
-    include_separator_reminder: bool = True,
+    include_separator_reminder: bool = False,
 ) -> str:
     """
-    Combina el texto del usuario con el texto extraído/transcrito de sus archivos adjuntos
-    y añade un recordatorio ligero del separador para modelos pequeños.
+    Combina el texto del usuario con el texto extraído/transcrito de sus archivos adjuntos.
+    El texto del usuario permanece limpio sin instrucciones meta para evitar que modelos
+    pequeños o de código las repitan.
     """
     blocks: List[str] = []
 
@@ -519,12 +574,6 @@ def format_user_message_with_attachments(
         user_text = "Analiza los archivos adjuntos, explica su contenido y destaca los puntos más importantes."
 
     blocks.append(user_text)
-
-    if include_separator_reminder:
-        blocks.append(
-            f"\n\n(Recuerda incluir al final de tu respuesta una línea con {FOLLOW_UP_SEPARATOR} "
-            "seguida de 3 opciones cortas de continuación en líneas separadas)."
-        )
 
     return "\n".join(blocks).strip()
 
@@ -903,7 +952,13 @@ async def generate_assistant_reply(
 
     # 2. Prompt Enhancer Determinista (specs/03-ai-orchestration.md §6):
     user_pref = get_user_style_preference(db)
-    enhanced_user_content = enhance_user_prompt(
+    session_directive = build_session_context_directive(
+        user_text=user_content,
+        user_message_count=user_message_count,
+        has_attachments=has_attachments,
+        dominant_style=user_pref["dominant_style"],
+    )
+    clean_user_content = enhance_user_prompt(
         user_text=user_content,
         user_message_count=user_message_count,
         has_attachments=has_attachments,
@@ -929,16 +984,16 @@ async def generate_assistant_reply(
 
         messages_a = build_ollama_messages_history(
             history_messages=history_messages,
-            current_user_content=enhanced_user_content,
+            current_user_content=clean_user_content,
             current_attachments=processed_attachments,
-            system_prompt=build_system_prompt(directive_a),
+            system_prompt=build_system_prompt(directive_a, session_directive=session_directive),
             context_summary=context_summary,
         )
         messages_b = build_ollama_messages_history(
             history_messages=history_messages,
-            current_user_content=enhanced_user_content,
+            current_user_content=clean_user_content,
             current_attachments=processed_attachments,
-            system_prompt=build_system_prompt(directive_b),
+            system_prompt=build_system_prompt(directive_b, session_directive=session_directive),
             context_summary=context_summary,
         )
 
@@ -974,10 +1029,10 @@ async def generate_assistant_reply(
 
     # Caso 3: Respuesta Estándar adaptada al historial `user_preferences`
     learned_style_directive = build_style_instruction_from_preferences(db)
-    system_prompt = build_system_prompt(learned_style_directive)
+    system_prompt = build_system_prompt(learned_style_directive, session_directive=session_directive)
     ollama_messages = build_ollama_messages_history(
         history_messages=history_messages,
-        current_user_content=enhanced_user_content,
+        current_user_content=clean_user_content,
         current_attachments=processed_attachments,
         system_prompt=system_prompt,
         context_summary=context_summary,
