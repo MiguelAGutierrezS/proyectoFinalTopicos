@@ -1,5 +1,5 @@
 /**
- * Cliente HTTP tipado para LocalGem Chat.
+ * Cliente HTTP tipado para LocalGem Chat v2.0.
  * Conecta con todos los endpoints de `http://localhost:8000/api` según `specs/02-database-and-api.md`.
  */
 
@@ -27,6 +27,14 @@ export interface Attachment {
   extracted_text?: string | null;
 }
 
+export interface MCPToolCallTrace {
+  tool_name: string;
+  arguments: Record<string, unknown>;
+  status: string;
+  result_preview: string;
+  duration_ms: number;
+}
+
 export interface Message {
   id: string;
   chat_id: string;
@@ -37,6 +45,8 @@ export interface Message {
   candidate_a: string | null;
   candidate_b: string | null;
   selected_candidate: CandidateChoice | null;
+  active_skill?: string | null;
+  mcp_tool_calls?: MCPToolCallTrace[];
   created_at: string;
   attachments: Attachment[];
 }
@@ -113,6 +123,73 @@ export interface HealthResponse {
   available_models: string[];
 }
 
+// --- Skills (SKILL.md) ---
+
+export interface SkillInfo {
+  id: string;
+  name: string;
+  description: string;
+  icon: string;
+  triggers: string[];
+  recommended_tools: string[];
+  instructions_preview: string;
+  file_path: string;
+}
+
+export interface SkillsListResponse {
+  skills: SkillInfo[];
+}
+
+export interface SkillCreatePayload {
+  id: string;
+  name: string;
+  description: string;
+  icon?: string;
+  triggers?: string[];
+  recommended_tools?: string[];
+  instructions: string;
+}
+
+// --- MCP (Model Context Protocol Local) ---
+
+export interface MCPToolDefinition {
+  name: string;
+  title: string;
+  description: string;
+  category: string;
+  input_schema: Record<string, unknown>;
+}
+
+export interface MCPToolsListResponse {
+  tools: MCPToolDefinition[];
+  mcp_enabled: boolean;
+}
+
+export interface MCPCallResponse {
+  tool_name: string;
+  arguments: Record<string, unknown>;
+  status: string;
+  result: string;
+  duration_ms: number;
+}
+
+// --- LangGraph StateGraph Schema (`GET /api/graph/schema`) ---
+
+export interface GraphNodeSchema {
+  id: string;
+  label: string;
+  description: string;
+}
+
+export interface GraphSchemaResponse {
+  engine: string;
+  version: string;
+  state_schema: string;
+  nodes: GraphNodeSchema[];
+  mermaid: string;
+}
+
+
 // =====================================================================
 // 2. Utilidades de Red y Manejo de Errores
 // =====================================================================
@@ -148,9 +225,6 @@ export function getAttachmentUrl(localPath: string): string {
 // 3. Funciones del Cliente API (`http://localhost:8000/api`)
 // =====================================================================
 
-/**
- * Verifica el estado del servidor FastAPI, SQLite y conexión con Ollama.
- */
 export async function fetchHealth(): Promise<HealthResponse> {
   const res = await fetch(`${API_BASE_URL}/health`, {
     method: "GET",
@@ -159,9 +233,6 @@ export async function fetchHealth(): Promise<HealthResponse> {
   return handleApiResponse<HealthResponse>(res);
 }
 
-/**
- * Obtiene la lista de modelos instalados localmente en Ollama (`GET /api/models`).
- */
 export async function fetchModels(): Promise<ModelsListResponse> {
   const res = await fetch(`${API_BASE_URL}/models`, {
     method: "GET",
@@ -170,9 +241,6 @@ export async function fetchModels(): Promise<ModelsListResponse> {
   return handleApiResponse<ModelsListResponse>(res);
 }
 
-/**
- * Obtiene todos los chats guardados en SQLite ordenados por `updated_at` descendente (`GET /api/chats`).
- */
 export async function fetchChats(): Promise<ChatSummary[]> {
   const res = await fetch(`${API_BASE_URL}/chats`, {
     method: "GET",
@@ -181,9 +249,6 @@ export async function fetchChats(): Promise<ChatSummary[]> {
   return handleApiResponse<ChatSummary[]>(res);
 }
 
-/**
- * Crea un nuevo chat vacío en SQLite (`POST /api/chats`).
- */
 export async function createChat(title: string = "Nuevo Chat"): Promise<ChatDetail> {
   const res = await fetch(`${API_BASE_URL}/chats`, {
     method: "POST",
@@ -193,9 +258,6 @@ export async function createChat(title: string = "Nuevo Chat"): Promise<ChatDeta
   return handleApiResponse<ChatDetail>(res);
 }
 
-/**
- * Obtiene el detalle de un chat con todos sus mensajes, adjuntos, opciones de seguimiento y estado A/B (`GET /api/chats/{chat_id}`).
- */
 export async function fetchChatById(chatId: string): Promise<ChatDetail> {
   const res = await fetch(`${API_BASE_URL}/chats/${encodeURIComponent(chatId)}`, {
     method: "GET",
@@ -204,9 +266,6 @@ export async function fetchChatById(chatId: string): Promise<ChatDetail> {
   return handleApiResponse<ChatDetail>(res);
 }
 
-/**
- * Actualiza el título de un chat (`PATCH /api/chats/{chat_id}`).
- */
 export async function updateChatTitle(chatId: string, title: string): Promise<ChatDetail> {
   const res = await fetch(`${API_BASE_URL}/chats/${encodeURIComponent(chatId)}`, {
     method: "PATCH",
@@ -216,9 +275,6 @@ export async function updateChatTitle(chatId: string, title: string): Promise<Ch
   return handleApiResponse<ChatDetail>(res);
 }
 
-/**
- * Elimina un chat y todo su historial de mensajes y archivos adjuntos (`DELETE /api/chats/{chat_id}`).
- */
 export async function deleteChat(chatId: string): Promise<ChatDeleteResponse> {
   const res = await fetch(`${API_BASE_URL}/chats/${encodeURIComponent(chatId)}`, {
     method: "DELETE",
@@ -231,24 +287,26 @@ export interface SendMessageParams {
   content: string;
   model?: string;
   compareMode?: boolean;
+  skillId?: string;
+  enableMcp?: boolean;
   files?: File[];
 }
 
-/**
- * Envía un mensaje del usuario con texto y/o archivos multimodales (`POST /api/chats/{chat_id}/messages`).
- * Recibe el mensaje guardado del usuario y la respuesta del asistente (con `follow_up_options` y pares A/B si aplica).
- */
 export async function sendMessage({
   chatId,
   content,
   model,
   compareMode = false,
+  skillId = "auto",
+  enableMcp = true,
   files = [],
 }: SendMessageParams): Promise<SendMessageResponse> {
   const formData = new FormData();
   formData.append("content", content);
   formData.append("compare_mode", String(compareMode));
   formData.append("force_ab_test", String(compareMode));
+  formData.append("skill_id", skillId || "auto");
+  formData.append("enable_mcp", String(enableMcp));
 
   if (model && model.trim()) {
     formData.append("model", model.trim());
@@ -265,9 +323,6 @@ export async function sendMessage({
   return handleApiResponse<SendMessageResponse>(res);
 }
 
-/**
- * Registra la respuesta preferida del usuario ('A' o 'B') en el Modo de Satisfacción A/B (`POST /api/messages/{message_id}/select-ab`).
- */
 export async function selectABCandidate(
   messageId: string,
   selected: CandidateChoice
@@ -283,9 +338,6 @@ export async function selectABCandidate(
   return handleApiResponse<SelectABResponse>(res);
 }
 
-/**
- * Obtiene el resumen de preferencias de estilo aprendidas del usuario (`GET /api/preferences/summary`).
- */
 export async function fetchPreferenceSummary(): Promise<PreferenceSummary> {
   const res = await fetch(`${API_BASE_URL}/preferences/summary`, {
     method: "GET",
@@ -293,3 +345,56 @@ export async function fetchPreferenceSummary(): Promise<PreferenceSummary> {
   });
   return handleApiResponse<PreferenceSummary>(res);
 }
+
+// =====================================================================
+// 4. Funciones para Skills (`SKILL.md`) y Herramientas MCP Locales
+// =====================================================================
+
+export async function fetchSkills(): Promise<SkillsListResponse> {
+  const res = await fetch(`${API_BASE_URL}/skills`, {
+    method: "GET",
+    cache: "no-store",
+  });
+  return handleApiResponse<SkillsListResponse>(res);
+}
+
+export async function createSkill(payload: SkillCreatePayload): Promise<SkillInfo> {
+  const res = await fetch(`${API_BASE_URL}/skills`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return handleApiResponse<SkillInfo>(res);
+}
+
+export async function fetchMCPTools(): Promise<MCPToolsListResponse> {
+  const res = await fetch(`${API_BASE_URL}/mcp/tools`, {
+    method: "GET",
+    cache: "no-store",
+  });
+  return handleApiResponse<MCPToolsListResponse>(res);
+}
+
+export async function callMCPTool(
+  toolName: string,
+  args: Record<string, unknown> = {}
+): Promise<MCPCallResponse> {
+  const res = await fetch(`${API_BASE_URL}/mcp/call`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      tool_name: toolName,
+      arguments: args,
+    }),
+  });
+  return handleApiResponse<MCPCallResponse>(res);
+}
+
+export async function fetchGraphSchema(): Promise<GraphSchemaResponse> {
+  const res = await fetch(`${API_BASE_URL}/graph/schema`, {
+    method: "GET",
+    cache: "no-store",
+  });
+  return handleApiResponse<GraphSchemaResponse>(res);
+}
+

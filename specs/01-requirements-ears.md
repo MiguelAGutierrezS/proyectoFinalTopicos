@@ -1,8 +1,8 @@
 # 01 — Requisitos del Sistema en Formato EARS (Easy Approach to Requirements Syntax)
 
 **Proyecto:** LocalGem Chat (Clon de Google Gemini 100% Local y Gratuito)  
-**Versión:** 1.0.0  
-**Estado:** Aprobado — Fuente Única de Verdad  
+**Versión:** 2.1.0  
+**Estado:** Aprobado — Fuente Única de Verdad (Incluye Vision Bridge Multimodal, Skills `SKILL.md`, MCP Local y Orquestación Agéntica con LangGraph)  
 
 ---
 
@@ -35,13 +35,15 @@ Este documento define los requisitos funcionales y no funcionales de **LocalGem 
 
 | ID | Tipo EARS | Especificación del Requisito |
 | :--- | :--- | :--- |
-| **REQ-MULTI-01** | Ubiquitous | El sistema deberá permitir adjuntar múltiples archivos por mensaje soportando tres categorías: **Fotos** (`.png`, `.jpg`, `.jpeg`, `.webp`), **Documentos** (`.pdf`, `.txt`, `.csv`, `.md`) y **Audios** (`.mp3`, `.wav`, `.m4a`). |
+| **REQ-MULTI-01** | Ubiquitous | El sistema deberá permitir adjuntar múltiples archivos por mensaje soportando tres categorías: **Fotos** (`.png`, `.jpg`, `.jpeg`, `.webp`), **Documentos** (`.pdf`, `.txt`, `.csv`, `.md`) y **Audios** (`.mp3`, `.wav`, `.m4a`, `.ogg`). |
 | **REQ-MULTI-02** | Event-Driven | **CUANDO** el usuario seleccione o arrastre archivos válidos al compositor de mensajes, el sistema deberá mostrar chips de previsualización (miniatura para imágenes, icono y nombre para documentos/audios) con la opción de quitarlos antes de enviar. |
 | **REQ-MULTI-03** | Event-Driven | **CUANDO** el backend reciba archivos adjuntos junto a un mensaje, el sistema deberá guardar cada archivo físico en el directorio local `backend/uploads/`, registrar su ruta en `attachments.local_path` y extraer su contenido textual o representación en `attachments.extracted_text`. |
 | **REQ-MULTI-04** | Event-Driven | **CUANDO** se adjunte un documento `.pdf`, `.txt`, `.csv` o `.md`, el sistema deberá extraer su texto completo localmente y almacenarlo en `extracted_text` para inyectarlo en el contexto del prompt enviado a Ollama. |
-| **REQ-MULTI-05** | Event-Driven | **CUANDO** se adjunte una foto (`.png`, `.jpg`, `.webp`), el sistema deberá codificar la imagen en Base64 para enviarla en el campo `images` de Ollama (si el modelo soporta visión) y además registrar los metadatos de la imagen (dimensiones, formato y nombre) en `extracted_text` como contexto de respaldo para modelos solo-texto. |
-| **REQ-MULTI-06** | Event-Driven | **CUANDO** se adjunte un archivo de audio (`.mp3`, `.wav`, `.m4a`), el sistema deberá transcribir su contenido a texto localmente (o extraer metadatos acústicos/duración como fallback si el motor STT local no está instalado) y guardar el resultado en `extracted_text` para que la IA pueda responder sobre el audio. |
+| **REQ-MULTI-05** | Event-Driven | **CUANDO** se adjunte una foto (`.png`, `.jpg`, `.jpeg`, `.webp`), el sistema deberá redimensionarla de forma segura ($\le 1024\text{px}$), codificarla en Base64 y ejecutar automáticamente el **Vision Bridge (Pipeline de Visión en 2 Etapas)**: invocar un modelo de visión instalado en Ollama (`moondream`, `llava`, `minicpm-v`, etc.) mediante un prompt limpio en `/api/generate` para extraer la descripción visual completa y texto visible (OCR), persistiendo tanto los metadatos técnicos de Pillow como el análisis visual en `attachments.extracted_text`. |
+| **REQ-MULTI-06** | Event-Driven | **CUANDO** se adjunte un archivo de audio (`.mp3`, `.wav`, `.m4a`, `.ogg`), el sistema deberá transcribir su contenido a texto localmente usando `faster-whisper` configurado con caché local libre de symlinks (`backend/models_cache/whisper`) para evitar errores de privilegios en Windows (`WinError 1314`), guardando la transcripción en `extracted_text`. |
 | **REQ-MULTI-07** | Unwanted Behavior | **SI** el usuario intenta subir un archivo con extensión no permitida o que supere el límite de 25 MB, **ENTONCES** el sistema deberá rechazar el archivo y mostrar una notificación clara indicando los formatos permitidos. |
+| **REQ-MULTI-08** | Complex | **MIENTRAS** una consulta incluya imágenes adjuntas (o el usuario seleccione un modelo de visión ligero como `moondream` que no sigue instrucciones complejas en español), **CUANDO** se genere la respuesta del asistente, el orquestador deberá utilizar el análisis visual extraído por el modelo de visión y delegar la redacción final en español, el formato Markdown, el Modo A/B y el bloque `---FOLLOW_UP_OPTIONS---` al modelo de lenguaje principal (`llama3.2` / `llama3.2:1b`), garantizando respuestas fluidas sin importar qué modelo esté seleccionado en la UI. |
+| **REQ-MULTI-09** | Event-Driven | **CUANDO** el usuario pegue una imagen desde el portapapeles (`Ctrl+V`) o pulse el botón de grabación de nota de voz `.wav` en el compositor, el sistema deberá capturar el recurso en el navegador y adjuntarlo como un archivo multimodal estándar listo para ser procesado por el backend. |
 
 ---
 
@@ -51,7 +53,7 @@ Este documento define los requisitos funcionales y no funcionales de **LocalGem 
 | :--- | :--- | :--- |
 | **REQ-VOICE-01** | Event-Driven | **CUANDO** el usuario pulse el botón de micrófono ("Dictar por voz"), el sistema deberá iniciar el reconocimiento de voz en tiempo real en español (configurable al idioma del navegador) e insertar progresivamente la transcripción parcial y final en el campo de texto del mensaje. |
 | **REQ-VOICE-02** | State-Driven | **MIENTRAS** el dictado por voz esté activo, el sistema deberá mostrar un indicador visual pulsante (estilo onda/pulso rojo) en el botón de micrófono permitiendo detener la captura con un clic adicional. |
-| **REQ-VOICE-03** | Unwanted Behavior | **SI** el navegador no soporta Web Speech API (`SpeechRecognition`/`webkitSpeechRecognition`) o el permiso de micrófono es denegado, **ENTONCES** el sistema deberá mostrar un aviso amigable al usuario sin bloquear el resto de la interfaz. |
+| **REQ-VOICE-03** | Unwanted Behavior | **SI** el navegador no soporta Web Speech API (`SpeechRecognition`/`webkitSpeechRecognition`) o el permiso de micrófono es denegado, **ENTONCES** el sistema deberá mostrar un aviso amigable al usuario sin bloquear el resto de la interfaz, permitiendo usar el grabador de notas de voz `.wav` nativo. |
 | **REQ-VOICE-04** | Ubiquitous | El sistema deberá incluir un botón de lectura en voz alta ("Escuchar respuesta" / TTS) en cada mensaje generado por la IA (incluyendo ambas tarjetas candidatas A y B en el modo A/B). |
 | **REQ-VOICE-05** | Event-Driven | **CUANDO** el usuario pulse el botón de lectura en voz alta (TTS) en una respuesta de la IA, el sistema deberá limpiar la sintaxis Markdown decorativa y leer el contenido utilizando `window.speechSynthesis` con una voz en español natural. |
 | **REQ-VOICE-06** | State-Driven | **MIENTRAS** una respuesta se esté leyendo en voz alta, el sistema deberá cambiar el icono del botón a "Detener lectura" y permitir cancelar o pausar la síntesis de voz inmediatamente al hacer clic. |
@@ -95,4 +97,47 @@ Este documento define los requisitos funcionales y no funcionales de **LocalGem 
 | **REQ-UI-05** | Ubiquitous | El sistema deberá aplicar **syntax highlighting** a todos los bloques de código ` ``` ` dentro de las respuestas de la IA, usando la librería `react-syntax-highlighter` con un tema oscuro compatible con el diseño (ej. `oneDark` o `atomDark`), diferenciando visualmente el lenguaje del bloque cuando el modelo lo especifique. |
 | **REQ-UI-06** | Event-Driven | **CUANDO** el usuario haga clic en el botón **"Copiar"** que aparece al hacer hover sobre cualquier bloque de código en una respuesta de la IA, el sistema deberá copiar el contenido del bloque al portapapeles (`navigator.clipboard.writeText`) y mostrar un estado visual de confirmación ("¡Copiado!") durante 2 segundos. |
 | **REQ-UI-07** | Ubiquitous | El sistema deberá incluir un archivo `README.md` en la raíz del repositorio con instrucciones claras de instalación, prerrequisitos (Python 3.10+, Node.js 18+, Ollama, ffmpeg) y cómo arrancar el proyecto con `start-localgem.bat` (Windows) o `start-localgem.sh` (Unix). |
+
+---
+
+## 8. Requisitos del Sistema de Skills Modulares (`REQ-SKILL`)
+
+> **Versión:** 2.0.0 — Sistema de habilidades modulares basado en archivos `SKILL.md` con frontmatter YAML.
+
+| ID | Tipo EARS | Especificación del Requisito |
+| :--- | :--- | :--- |
+| **REQ-SKILL-01** | Ubiquitous | El sistema deberá descubrir y cargar automáticamente las habilidades modulares (*Skills*) almacenadas en `backend/skills/<skill_id>/SKILL.md`, parseando su frontmatter YAML (`id`, `name`, `description`, `icon`, `triggers`, `category`) y su cuerpo de instrucciones Markdown. |
+| **REQ-SKILL-02** | Ubiquitous | El sistema deberá incluir al menos 4 Skills preinstaladas listas para producción: `code-architect` (Arquitecto de Software), `data-analyst` (Analista de Datos CSV/PDF), `academic-tutor` (Tutor Universitario) y `sql-specialist` (Especialista en SQL y Bases de Datos). |
+| **REQ-SKILL-03** | Event-Driven | **CUANDO** el usuario seleccione manualmente una Skill en la interfaz (o escriba un comando `/skill`) antes de enviar un mensaje, el orquestador deberá inyectar las directivas expertas del `SKILL.md` correspondiente en el System Prompt y registrar el identificador de la Skill en `messages.active_skill`. |
+| **REQ-SKILL-04** | Event-Driven | **CUANDO** el usuario envíe un mensaje con el modo de **Auto-Skill** activado (sin haber forzado una Skill específica) y el texto o adjuntos coincidan con los `triggers` léxicos de una Skill, el sistema deberá activar automáticamente dicha Skill e indicarlo visualmente en la tarjeta de respuesta de la IA. |
+| **REQ-SKILL-05** | Event-Driven | **CUANDO** el usuario cree o guarde una nueva Skill personalizada desde la API (`POST /api/skills`), el sistema deberá generar el archivo `backend/skills/<skill_id>/SKILL.md` en disco y dejarla inmediatamente disponible en el catálogo. |
+
+---
+
+## 9. Requisitos de Integración con Model Context Protocol (`REQ-MCP`)
+
+> **Versión:** 2.0.0 — Soporte nativo para herramientas MCP locales y servidores MCP externos con enrutamiento híbrido resiliente para modelos pequeños en Ollama.
+
+| ID | Tipo EARS | Especificación del Requisito |
+| :--- | :--- | :--- |
+| **REQ-MCP-01** | Ubiquitous | El sistema deberá contar con un motor **MCP (Model Context Protocol)** local (`backend/services/mcp_service.py`) que exponga un catálogo estandarizado de herramientas (`tools/list`) y un ejecutor seguro (`tools/call`), soportando tanto herramientas MCP nativas como servidores MCP externos configurables. |
+| **REQ-MCP-02** | Ubiquitous | El sistema deberá proveer de serie 5 herramientas MCP locales verificables sin requerir claves de API de pago: `mcp_system_time` (fecha, hora y diagnóstico de entorno), `mcp_calculator` (evaluador matemático y estadístico exacto), `mcp_sqlite_inspector` (consulta de métricas reales e inspección solo-lectura de `localgem.db`), `mcp_workspace_reader` (exploración y lectura segura de archivos del proyecto/subidas) y `mcp_wikipedia_search` (búsqueda enciclopédica verificada). |
+| **REQ-MCP-03** | Event-Driven | **CUANDO** el usuario envíe un mensaje con MCP habilitado (`enable_mcp = true`), el **Router Híbrido MCP** deberá detectar si la consulta requiere datos en tiempo real, cálculo exacto, inspección de base de datos, lectura de archivos o búsqueda externa, ejecutar las herramientas MCP correspondientes e inyectar sus resultados estructurados en el bloque `[RESULTADOS VERIFICADOS DE HERRAMIENTAS MCP]` del prompt enviado a Ollama. |
+| **REQ-MCP-04** | Ubiquitous | El sistema deberá persistir las trazas de todas las herramientas MCP invocadas en cada turno dentro de `messages.mcp_calls_json` (incluyendo `tool_name`, `arguments`, `result_preview`, `status` y `duration_ms`) y mostrarlas como insignias (*badges*) interactivas en el mensaje del asistente en el frontend. |
+| **REQ-MCP-05** | Unwanted Behavior | **SI** la ejecución de una herramienta MCP falla o excede el tiempo máximo de espera (8 segundos), **ENTONCES** el sistema deberá capturar la excepción, registrar el estado de error en la traza MCP y permitir que el modelo de Ollama responda normalmente sin interrumpir la conversación. |
+
+---
+
+## 10. Requisitos de Orquestación Agéntica con LangGraph (`REQ-GRAPH`)
+
+> **Versión:** 2.1.0 — Orquestación basada en máquina de estados finitos (`StateGraph`) mediante LangGraph (`specs/04-langgraph-architecture.md`).
+
+| ID | Tipo EARS | Especificación del Requisito |
+| :--- | :--- | :--- |
+| **REQ-GRAPH-01** | Ubiquitous | El sistema deberá orquestar todo el flujo de generación de respuestas del asistente mediante un grafo de estados compilado con **LangGraph** (`StateGraph(LocalGemGraphState)`) definido en `backend/services/langgraph_service.py`. |
+| **REQ-GRAPH-02** | Ubiquitous | El grafo `StateGraph` deberá estructurarse en nodos modulares con responsabilidad única: `node_load_context`, `node_skill_router`, `node_mcp_executor`, `node_vision_bridge`, `node_context_compactor`, `node_prompt_builder`, `node_generate_standard`, `node_generate_ab` y `node_parse_and_fallback`. |
+| **REQ-GRAPH-03** | Event-Driven | **CUANDO** el grafo evalúe las aristas condicionales de un turno (`route_mcp_check`, `route_vision_check`, `route_compaction_check` y `route_generation_mode`), el sistema deberá decidir dinámicamente qué nodos especializados ejecutar sin invocar pasos innecesarios. |
+| **REQ-GRAPH-04** | Ubiquitous | Cada nodo ejecutado dentro del `StateGraph` deberá registrar en `state["graph_trace"]` su nombre (`node`), estado (`ok`, `skipped`, `fallback` o `error`), duración en milisegundos (`duration_ms`) y detalle operativo para fines de auditoría y observabilidad. |
+| **REQ-GRAPH-05** | Event-Driven | **CUANDO** el cliente consulte `GET /api/graph/schema`, el sistema deberá devolver la topología completa del `StateGraph` de LangGraph, incluyendo la lista de nodos y su definición en formato **Mermaid** (`flowchart TD`) para su inspección visual. |
+| **REQ-GRAPH-06** | Unwanted Behavior | **SI** cualquier nodo intermedio del grafo (`node_mcp_executor`, `node_vision_bridge` o `node_context_compactor`) sufre una excepción en tiempo de ejecución, **ENTONCES** el nodo deberá capturar el fallo, registrar `status = "fallback"` en `graph_trace` y permitir que el grafo continúe hacia la generación y el parser final sin abortar la respuesta al usuario. |
 

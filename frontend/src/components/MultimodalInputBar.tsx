@@ -13,7 +13,12 @@ import {
   SplitSquareHorizontal,
   Loader2,
   AlertCircle,
+  Zap,
+  Plug,
+  Radio,
+  Square,
 } from "lucide-react";
+import { SkillInfo } from "@/lib/api";
 
 export interface MultimodalInputBarProps {
   onSendMessage: (params: {
@@ -24,6 +29,12 @@ export interface MultimodalInputBarProps {
   isLoading: boolean;
   compareMode: boolean;
   onToggleCompareMode: (enabled: boolean) => void;
+  skills: SkillInfo[];
+  selectedSkillId: string;
+  onSelectSkillId: (skillId: string) => void;
+  enableMcp: boolean;
+  onToggleMcp: (enabled: boolean) => void;
+  onOpenSkillsMcpModal?: () => void;
 }
 
 interface PreviewFileItem {
@@ -83,11 +94,54 @@ function formatFileSize(bytes: number): string {
   return `${(kb / 1024).toFixed(1)} MB`;
 }
 
+/**
+ * Codifica muestras de audio Float32 en un archivo WAV PCM 16-bit estándar (16 kHz mono)
+ * para que `faster-whisper` en el backend lo transcriba sin requerir FFmpeg externo.
+ */
+function encodeWavFromFloat32(samples: Float32Array, sampleRate: number): Blob {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+
+  const writeString = (offset: number, str: string) => {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  };
+
+  writeString(0, "RIFF");
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeString(8, "WAVE");
+  writeString(12, "fmt ");
+  view.setUint32(16, 16, true); // PCM chunk size
+  view.setUint16(20, 1, true); // PCM format
+  view.setUint16(22, 1, true); // Mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true); // 16-bit
+  writeString(36, "data");
+  view.setUint32(40, samples.length * 2, true);
+
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++, offset += 2) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
 export default function MultimodalInputBar({
   onSendMessage,
   isLoading,
   compareMode,
   onToggleCompareMode,
+  skills,
+  selectedSkillId,
+  onSelectSkillId,
+  enableMcp,
+  onToggleMcp,
+  onOpenSkillsMcpModal,
 }: MultimodalInputBarProps) {
   const [text, setText] = useState("");
   const [attachedItems, setAttachedItems] = useState<PreviewFileItem[]>([]);
@@ -96,16 +150,28 @@ export default function MultimodalInputBar({
   const [voiceWarning, setVoiceWarning] = useState<string | null>(null);
   const [isDraggingOver, setIsDraggingOver] = useState(false);
 
+  // Grabadora de nota de voz .wav para faster-whisper (REQ-MULTI-09)
+  const [isRecordingWav, setIsRecordingWav] = useState(false);
+  const [recordingSeconds, setRecordingSeconds] = useState(0);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const scriptNodeRef = useRef<ScriptProcessorNode | null>(null);
+  const recordedChunksRef = useRef<Float32Array[]>([]);
+  const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
 
-  // Limpiar URLs de previsualización al desmontar
+  // Limpiar recursos al desmontar
   useEffect(() => {
     return () => {
       attachedItems.forEach((item) => {
         if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
       });
+      if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
+      mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
+      void audioContextRef.current?.close();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -118,7 +184,7 @@ export default function MultimodalInputBar({
     el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
   }, [text, interimTranscript]);
 
-  const handleFilesSelected = (fileList: FileList | null) => {
+  const handleFilesSelected = (fileList: FileList | File[] | null) => {
     if (!fileList || fileList.length === 0) return;
     setVoiceWarning(null);
 
@@ -151,6 +217,34 @@ export default function MultimodalInputBar({
     }
   };
 
+  // Soporte Ctrl+V para pegar capturas de pantalla directamente desde el portapapeles (REQ-MULTI-09)
+  const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+
+    const pastedFiles: File[] = [];
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item.kind === "file") {
+        const blob = item.getAsFile();
+        if (blob) {
+          const ext = blob.type.split("/")[1] || "png";
+          const fileName =
+            blob.name && blob.name !== "image.png"
+              ? blob.name
+              : `captura_${new Date().toISOString().slice(11, 19).replace(/:/g, "-")}.${ext}`;
+          const namedFile = new File([blob], fileName, { type: blob.type });
+          pastedFiles.push(namedFile);
+        }
+      }
+    }
+
+    if (pastedFiles.length > 0) {
+      e.preventDefault();
+      handleFilesSelected(pastedFiles);
+    }
+  };
+
   const handleRemoveAttachment = (id: string) => {
     setAttachedItems((prev) => {
       const target = prev.find((item) => item.id === id);
@@ -159,6 +253,84 @@ export default function MultimodalInputBar({
       }
       return prev.filter((item) => item.id !== id);
     });
+  };
+
+  // Grabación de nota de voz .wav nativa (para faster-whisper en el backend)
+  const toggleWavRecording = async () => {
+    setVoiceWarning(null);
+
+    if (isRecordingWav) {
+      if (recordingTimerRef.current) {
+        clearInterval(recordingTimerRef.current);
+        recordingTimerRef.current = null;
+      }
+      setIsRecordingWav(false);
+
+      const sampleRate = audioContextRef.current?.sampleRate || 16000;
+      scriptNodeRef.current?.disconnect();
+      mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
+      await audioContextRef.current?.close().catch(() => {});
+
+      const chunks = recordedChunksRef.current;
+      const totalLength = chunks.reduce((acc, c) => acc + c.length, 0);
+      if (totalLength > 0) {
+        const merged = new Float32Array(totalLength);
+        let offset = 0;
+        for (const chunk of chunks) {
+          merged.set(chunk, offset);
+          offset += chunk.length;
+        }
+        const wavBlob = encodeWavFromFloat32(merged, sampleRate);
+        const fileName = `nota_voz_${new Date()
+          .toISOString()
+          .slice(11, 19)
+          .replace(/:/g, "-")}.wav`;
+        const wavFile = new File([wavBlob], fileName, { type: "audio/wav" });
+        handleFilesSelected([wavFile]);
+      }
+      recordedChunksRef.current = [];
+      setRecordingSeconds(0);
+      return;
+    }
+
+    if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
+      setVoiceWarning("Tu navegador no permite grabar audio desde el micrófono.");
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      const audioCtx = new AudioCtx({ sampleRate: 16000 });
+      const source = audioCtx.createMediaStreamSource(stream);
+      const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+
+      recordedChunksRef.current = [];
+      processor.onaudioprocess = (ev) => {
+        const inputData = ev.inputBuffer.getChannelData(0);
+        recordedChunksRef.current.push(new Float32Array(inputData));
+      };
+
+      source.connect(processor);
+      processor.connect(audioCtx.destination);
+
+      mediaStreamRef.current = stream;
+      audioContextRef.current = audioCtx;
+      scriptNodeRef.current = processor;
+      setRecordingSeconds(0);
+      setIsRecordingWav(true);
+
+      recordingTimerRef.current = setInterval(() => {
+        setRecordingSeconds((s) => s + 1);
+      }, 1000);
+    } catch {
+      setVoiceWarning(
+        "No se pudo acceder al micrófono para grabar la nota de voz (.wav)."
+      );
+      setIsRecordingWav(false);
+    }
   };
 
   const toggleVoiceDictation = () => {
@@ -178,7 +350,7 @@ export default function MultimodalInputBar({
 
     if (!SpeechRecognitionConstructor) {
       setVoiceWarning(
-        "Tu navegador no soporta dictado por voz en vivo (Web Speech API). Usa Chrome o Edge."
+        "Tu navegador no soporta dictado en vivo (Web Speech API). Puedes usar el botón de Grabar Audio (.wav) junto al micrófono para transcribir con faster-whisper."
       );
       return;
     }
@@ -284,7 +456,7 @@ export default function MultimodalInputBar({
     !isLoading && (displayedText.trim().length > 0 || attachedItems.length > 0);
 
   return (
-    <div className="w-full max-w-4xl mx-auto px-3 sm:px-6 pb-4 pt-2">
+    <div className="w-full max-w-4xl mx-auto px-3 sm:px-6 pb-4 pt-1.5">
       {/* Aviso de voz o validación de archivos */}
       {voiceWarning && (
         <div className="mb-2 flex items-center justify-between gap-2 px-3.5 py-2 rounded-xl bg-amber-500/15 border border-amber-500/40 text-amber-200 text-xs">
@@ -302,7 +474,65 @@ export default function MultimodalInputBar({
         </div>
       )}
 
-      {/* Contenedor estilo cápsula de Google Gemini (#1e1f20) con soporte Drag & Drop */}
+      {/* Barra rápida superior de Skills (`SKILL.md`) y Herramientas MCP Locales */}
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-2 px-1">
+        <div className="flex flex-wrap items-center gap-1.5">
+          {/* Selector de Skill activa */}
+          <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-[#1e1f20] border border-[#333537] text-xs">
+            <Zap className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+            <span className="text-[#9aa0a6] hidden sm:inline">Skill:</span>
+            <select
+              value={selectedSkillId}
+              onChange={(e) => onSelectSkillId(e.target.value)}
+              aria-label="Seleccionar Skill especializada"
+              className="bg-transparent text-[#e3e3e3] font-medium focus:outline-none cursor-pointer text-xs"
+            >
+              <option value="auto" className="bg-[#1e1f20] text-[#e3e3e3]">
+                ✨ Auto-detección (según consulta)
+              </option>
+              <option value="none" className="bg-[#1e1f20] text-[#9aa0a6]">
+                Sin Skill adicional
+              </option>
+              {skills.map((sk) => (
+                <option
+                  key={sk.id}
+                  value={sk.id}
+                  className="bg-[#1e1f20] text-[#e3e3e3]"
+                >
+                  {sk.name} (/{sk.id})
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* Toggle MCP Tools */}
+          <button
+            type="button"
+            onClick={() => onToggleMcp(!enableMcp)}
+            title="Activar/Desactivar herramientas locales Model Context Protocol (Calculadora, SQLite, Reloj, Archivos, Wikipedia)"
+            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border transition-all ${
+              enableMcp
+                ? "bg-emerald-500/15 border-emerald-500/40 text-emerald-300"
+                : "bg-[#1e1f20] border-[#333537] text-[#9aa0a6]"
+            }`}
+          >
+            <Plug className="w-3.5 h-3.5" />
+            <span>MCP {enableMcp ? "Activo" : "Off"}</span>
+          </button>
+        </div>
+
+        {onOpenSkillsMcpModal && (
+          <button
+            type="button"
+            onClick={onOpenSkillsMcpModal}
+            className="text-[11px] text-[#4b90ff] hover:text-blue-300 hover:underline transition-colors"
+          >
+            Ver / Probar Skills y Herramientas MCP →
+          </button>
+        )}
+      </div>
+
+      {/* Contenedor estilo cápsula de Google Gemini (#1e1f20) con soporte Drag & Drop y Ctrl+V */}
       <form
         onSubmit={handleSubmit}
         onDragOver={(e) => {
@@ -331,7 +561,7 @@ export default function MultimodalInputBar({
         className={`relative rounded-3xl bg-[#1e1f20] border transition-all shadow-lg ${
           isDraggingOver
             ? "border-[#4b90ff] shadow-blue-500/20 ring-2 ring-[#4b90ff]/30"
-            : isListening
+            : isListening || isRecordingWav
             ? "border-red-500/70 shadow-red-500/10"
             : compareMode
             ? "border-purple-500/60 shadow-purple-500/10"
@@ -421,7 +651,7 @@ export default function MultimodalInputBar({
             <Plus className="w-5 h-5" />
           </button>
 
-          {/* Área de texto auto-expandible */}
+          {/* Área de texto auto-expandible con soporte Ctrl+V */}
           <textarea
             ref={textareaRef}
             rows={1}
@@ -430,19 +660,22 @@ export default function MultimodalInputBar({
               setInterimTranscript("");
               setText(e.target.value);
             }}
+            onPaste={handlePaste}
             onKeyDown={handleKeyDown}
             disabled={isLoading}
             placeholder={
-              isListening
+              isRecordingWav
+                ? `Grabando nota de voz WAV (${recordingSeconds}s)... pulsa detener para adjuntar`
+                : isListening
                 ? "Escuchando en vivo (es-ES)... habla ahora"
-                : "Escribe un mensaje a LocalGem o adjunta fotos, PDFs, CSV o audios..."
+                : "Escribe un mensaje, pega una captura (Ctrl+V) o adjunta fotos, PDFs, CSV o audios..."
             }
             className="flex-1 bg-transparent text-sm sm:text-base text-[#e3e3e3] placeholder-[#9aa0a6] resize-none focus:outline-none py-1.5 max-h-40 overflow-y-auto"
           />
 
-          {/* Controles derechos: Comparar 2 respuestas, Micrófono en vivo y Enviar */}
+          {/* Controles derechos: Comparar 2 respuestas, Grabar nota de voz WAV, Dictado en vivo y Enviar */}
           <div className="flex items-center gap-1.5 shrink-0">
-            {/* Botón "Comparar 2 respuestas" accesible junto al botón de enviar */}
+            {/* Botón "Comparar 2 respuestas" */}
             <button
               type="button"
               onClick={() => onToggleCompareMode(!compareMode)}
@@ -457,7 +690,36 @@ export default function MultimodalInputBar({
               <span className="hidden md:inline">Comparar 2 respuestas</span>
             </button>
 
-            {/* Botón de Micrófono en vivo (Web Speech API es-ES con animación de pulso rojo) */}
+            {/* Botón de Grabación de Nota de Voz .WAV (Transcripción local con faster-whisper) */}
+            <button
+              type="button"
+              onClick={() => void toggleWavRecording()}
+              disabled={isLoading}
+              title={
+                isRecordingWav
+                  ? `Detener grabación WAV (${recordingSeconds}s) y adjuntar para faster-whisper`
+                  : "Grabar nota de voz (.wav) para transcripción local con faster-whisper"
+              }
+              className={`relative flex items-center gap-1 px-2.5 py-2 rounded-full text-xs font-medium transition-all ${
+                isRecordingWav
+                  ? "bg-red-500 text-white shadow-lg shadow-red-500/40 animate-pulse"
+                  : "bg-[#282a2c] hover:bg-[#333537] text-purple-300"
+              }`}
+            >
+              {isRecordingWav ? (
+                <>
+                  <Square className="w-3.5 h-3.5 fill-current" />
+                  <span>{recordingSeconds}s</span>
+                </>
+              ) : (
+                <>
+                  <Radio className="w-4 h-4" />
+                  <span className="hidden lg:inline">Audio IA</span>
+                </>
+              )}
+            </button>
+
+            {/* Botón de Micrófono en vivo (Web Speech API es-ES) */}
             <button
               type="button"
               onClick={toggleVoiceDictation}
@@ -465,7 +727,7 @@ export default function MultimodalInputBar({
               title={
                 isListening
                   ? "Detener dictado por voz"
-                  : "Dictar por voz en tiempo real (es-ES)"
+                  : "Dictar texto por voz en tiempo real (es-ES)"
               }
               className={`relative p-2.5 rounded-full transition-all ${
                 isListening
@@ -501,11 +763,11 @@ export default function MultimodalInputBar({
         </div>
 
         {/* Barra informativa inferior sutil */}
-        <div className="flex items-center justify-between px-4 pb-2 text-[11px] text-[#9aa0a6]/80">
+        <div className="flex flex-wrap items-center justify-between gap-2 px-4 pb-2 text-[11px] text-[#9aa0a6]/80">
           <div className="flex items-center gap-3">
             <span className="inline-flex items-center gap-1">
               <ImageIcon className="w-3 h-3 text-[#4b90ff]" />
-              Fotos, PDF, CSV, TXT, MD y Audio soportados
+              Vision Bridge (moondream + llama3.2) • PDF • CSV • Audio Whisper • Ctrl+V
             </span>
           </div>
           {compareMode && (

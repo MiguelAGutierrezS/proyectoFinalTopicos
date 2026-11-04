@@ -1,7 +1,7 @@
 import json
 import uuid
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy import (
     Boolean,
@@ -78,9 +78,9 @@ class Chat(Base):
 class Message(Base):
     """
     Tabla `messages`: Almacena todos los mensajes del usuario y respuestas de la IA.
-    Campos exactos según specs/02-database-and-api.md:
+    Campos exactos según specs/02-database-and-api.md v2.0:
     - id, chat_id, role, content, follow_up_options_json, is_ab_test,
-      candidate_a, candidate_b, selected_candidate, created_at
+      candidate_a, candidate_b, selected_candidate, active_skill, mcp_calls_json, created_at
     """
 
     __tablename__ = "messages"
@@ -98,6 +98,8 @@ class Message(Base):
     candidate_a = Column(Text, nullable=True, default=None)
     candidate_b = Column(Text, nullable=True, default=None)
     selected_candidate = Column(Text, nullable=True, default=None)
+    active_skill = Column(Text, nullable=True, default=None)
+    mcp_calls_json = Column(Text, nullable=False, default="[]")
     created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now)
 
     __table_args__ = (
@@ -147,6 +149,27 @@ class Message(Base):
         else:
             cleaned = [str(item).strip() for item in options if str(item).strip()]
             self.follow_up_options_json = json.dumps(cleaned, ensure_ascii=False)
+
+    @property
+    def mcp_tool_calls(self) -> List[Dict[str, Any]]:
+        """Deserializa `mcp_calls_json` a una lista de objetos con las trazas de herramientas MCP."""
+        if not self.mcp_calls_json:
+            return []
+        try:
+            parsed = json.loads(self.mcp_calls_json)
+            if isinstance(parsed, list):
+                return [item for item in parsed if isinstance(item, dict)]
+            return []
+        except (ValueError, TypeError):
+            return []
+
+    @mcp_tool_calls.setter
+    def mcp_tool_calls(self, calls: Optional[List[Dict[str, Any]]]) -> None:
+        """Serializa una lista de trazas de herramientas MCP en `mcp_calls_json`."""
+        if not calls:
+            self.mcp_calls_json = "[]"
+        else:
+            self.mcp_calls_json = json.dumps(calls, ensure_ascii=False)
 
 
 class Attachment(Base):

@@ -1,14 +1,15 @@
 # 02 — Esquema de Base de Datos (`localgem.db`) y Contratos de API REST
 
 **Proyecto:** LocalGem Chat  
+**Versión:** 2.1.0  
 **Base de Datos:** SQLite 3 (`backend/localgem.db`) con SQLAlchemy 2.0 ORM  
-**Servidor API:** FastAPI (`http://localhost:8000`)  
+**Servidor API:** FastAPI (`http://localhost:8000`) + Motor Agéntico LangGraph (`StateGraph`)  
 
 ---
 
 ## 1. Esquema Exacto de Base de Datos SQLite (`localgem.db`)
 
-La base de datos consta de **4 tablas obligatorias** con integridad referencial activada (`PRAGMA foreign_keys = ON;`).
+La base de datos consta de **4 tablas obligatorias** con integridad referencial activada (`PRAGMA foreign_keys = ON;`) y migración automática (`ALTER TABLE`) al iniciar `init_db()` para preservar datos existentes.
 
 ### 1.1 Diagrama Entidad-Relación (Mermaid)
 
@@ -37,6 +38,8 @@ erDiagram
         TEXT candidate_a "Respuesta A (concisa/directa)"
         TEXT candidate_b "Respuesta B (detallada/explicativa)"
         TEXT selected_candidate "'A' | 'B' | NULL"
+        TEXT active_skill "ID de la Skill aplicada en el turno (ej. 'code-architect' o NULL)"
+        TEXT mcp_calls_json "JSON array con trazas de herramientas MCP ejecutadas"
         DATETIME created_at "UTC timestamp"
     }
 
@@ -45,9 +48,9 @@ erDiagram
         TEXT message_id FK "Referencia a messages.id"
         TEXT file_name "Nombre original del archivo"
         TEXT file_type "'image' | 'document' | 'audio'"
-        TEXT mime_type "Ej. image/png, application/pdf"
+        TEXT mime_type "Ej. image/png, application/pdf, audio/wav"
         TEXT local_path "Ruta relativa/absoluta en disco"
-        TEXT extracted_text "Texto extraído, transcripción o metadatos"
+        TEXT extracted_text "Texto extraído, transcripción faster-whisper o descripción Vision Bridge"
     }
 
     user_preferences {
@@ -76,7 +79,7 @@ CREATE TABLE IF NOT EXISTS chats (
 ```
 
 #### Tabla 2: `messages`
-Almacena todos los mensajes enviados por el usuario y generados por la IA, incluyendo las opciones de seguimiento y los datos de pruebas A/B.
+Almacena todos los mensajes enviados por el usuario y generados por la IA, incluyendo las opciones de seguimiento, datos de pruebas A/B, la Skill activa y las trazas de ejecución MCP.
 ```sql
 CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
@@ -88,6 +91,8 @@ CREATE TABLE IF NOT EXISTS messages (
     candidate_a TEXT DEFAULT NULL,
     candidate_b TEXT DEFAULT NULL,
     selected_candidate TEXT DEFAULT NULL CHECK(selected_candidate IN ('A', 'B') OR selected_candidate IS NULL),
+    active_skill TEXT DEFAULT NULL,            -- ID de la Skill activa en este mensaje (v2.0)
+    mcp_calls_json TEXT NOT NULL DEFAULT '[]', -- JSON array de llamadas MCP ejecutadas (v2.0)
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE
 );
@@ -95,7 +100,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id);
 ```
 
 #### Tabla 3: `attachments`
-Almacena los archivos multimodales subidos por el usuario y asociados a un mensaje específico.
+Almacena los archivos multimodales subidos por el usuario y asociados a un mensaje específico. Para imágenes, `extracted_text` almacena tanto los metadatos técnicos de Pillow como la descripción visual generada por el **Vision Bridge** (`moondream` / `llava`).
 ```sql
 CREATE TABLE IF NOT EXISTS attachments (
     id TEXT PRIMARY KEY,
@@ -128,7 +133,9 @@ CREATE INDEX IF NOT EXISTS idx_user_preferences_message_id ON user_preferences(m
 ## 2. Reglas de Mapeo en SQLAlchemy (`backend/models.py`)
 
 1. Todos los `id` se generan en Python mediante `str(uuid.uuid4())`.
-2. En el modelo `Message`, se debe incluir una propiedad de conveniencia `@property def follow_up_options(self) -> list[str]` que deserialice `follow_up_options_json` con `json.loads()` (devolviendo `[]` si es nulo o inválido).
+2. En el modelo `Message`, se deben incluir las propiedades de conveniencia:
+   - `@property def follow_up_options(self) -> list[str]` que deserialice `follow_up_options_json` con `json.loads()` (devolviendo `[]` si es nulo o inválido).
+   - `@property def mcp_tool_calls(self) -> list[dict]` que deserialice `mcp_calls_json` con `json.loads()` (devolviendo `[]` si es nulo o inválido).
 3. Las relaciones deben declararse con `cascade="all, delete-orphan"`:
    - `Chat.messages` $\rightarrow$ `relationship("Message", back_populates="chat", cascade="all, delete-orphan", order_by="Message.created_at")`
    - `Message.attachments` $\rightarrow$ `relationship("Attachment", back_populates="message", cascade="all, delete-orphan")`
@@ -156,7 +163,7 @@ Verifica el estado del backend, la conexión con SQLite y la disponibilidad de O
   "database": "connected",
   "ollama_reachable": true,
   "active_model": "llama3.2:latest",
-  "available_models": ["llama3.2:latest", "llava:latest", "mistral:latest"]
+  "available_models": ["moondream:latest", "llama3.2:1b", "llama3.2:latest"]
 }
 ```
 
@@ -239,6 +246,8 @@ Obtiene el detalle completo de un chat incluyendo todos sus mensajes ordenados c
       "candidate_a": null,
       "candidate_b": null,
       "selected_candidate": null,
+      "active_skill": "code-architect",
+      "mcp_tool_calls": [],
       "created_at": "2026-10-19T10:15:05Z",
       "attachments": [
         {
@@ -266,6 +275,8 @@ Obtiene el detalle completo de un chat incluyendo todos sus mensajes ordenados c
       "candidate_a": null,
       "candidate_b": null,
       "selected_candidate": null,
+      "active_skill": "code-architect",
+      "mcp_tool_calls": [],
       "created_at": "2026-10-19T10:15:12Z",
       "attachments": []
     }
@@ -297,17 +308,19 @@ Elimina un chat, todos sus mensajes, sus registros de `attachments` y borra los 
 
 ---
 
-### 3.3 Envío de Mensajes Multimodales y Generación de IA
+### 3.3 Envío de Mensajes Multimodales, Skills, MCP y Generación de IA
 
 #### `POST /api/chats/{chat_id}/messages`
-Envía un mensaje del usuario (con texto y/o archivos multimodales), procesa los adjuntos, verifica si corresponde activar el **Modo A/B** (cada 3 mensajes del usuario o si `force_ab_test=true`), invoca a Ollama y devuelve tanto el mensaje del usuario como la respuesta del asistente con sus 2-3 opciones de seguimiento.
+Envía un mensaje del usuario (con texto y/o archivos multimodales), procesa los adjuntos (ejecutando el **Vision Bridge** para imágenes y `faster-whisper` para audios), aplica la **Skill** seleccionada o auto-detectada, ejecuta las herramientas **MCP** pertinentes si `enable_mcp=true`, verifica si corresponde activar el **Modo A/B** (`user_msg_count % 3 == 0` o `force_ab_test=true`), invoca a Ollama y devuelve el mensaje del usuario y la respuesta del asistente.
 
 - **Content-Type**: `multipart/form-data`
 - **Form Fields**:
   - `content` (`string`, obligatorio si no hay archivos): Texto del mensaje del usuario.
   - `force_ab_test` (`boolean`, opcional, default `false`): Si es `true` (botón "Comparar 2 respuestas"), fuerza generación dual A/B.
   - `model` (`string`, opcional): Nombre del modelo en Ollama (ej. `llama3.2:latest`). Si se omite, usa el modelo activo por defecto.
-  - `files` (`list[UploadFile]`, opcional): Archivos subidos (`.png`, `.jpg`, `.webp`, `.pdf`, `.txt`, `.csv`, `.md`, `.mp3`, `.wav`, `.m4a`).
+  - `skill_id` (`string`, opcional): Identificador de la Skill a aplicar (ej. `code-architect`, `data-analyst`, `auto`, o vacío).
+  - `enable_mcp` (`boolean`, opcional, default `true`): Si es `true`, habilita el Router Híbrido MCP para ejecutar herramientas locales cuando la consulta lo requiera.
+  - `files` (`list[UploadFile]`, opcional): Archivos subidos (`.png`, `.jpg`, `.jpeg`, `.webp`, `.pdf`, `.txt`, `.csv`, `.md`, `.mp3`, `.wav`, `.m4a`, `.ogg`).
 
 - **Lógica de Activación A/B en este Endpoint**:
   1. Se inserta el nuevo mensaje con `role = "user"` en la base de datos.
@@ -330,6 +343,8 @@ Envía un mensaje del usuario (con texto y/o archivos multimodales), procesa los
     "candidate_a": null,
     "candidate_b": null,
     "selected_candidate": null,
+    "active_skill": "code-architect",
+    "mcp_tool_calls": [],
     "created_at": "2026-10-19T10:25:00Z",
     "attachments": []
   },
@@ -347,6 +362,8 @@ Envía un mensaje del usuario (con texto y/o archivos multimodales), procesa los
     "candidate_a": "Usa una estructura de 4 capas: `domain/` (entidades), `application/` (casos de uso), `infrastructure/` (SQLAlchemy/Ollama) y `presentation/` (rutas FastAPI).",
     "candidate_b": "Para estructurar un proyecto Python siguiendo Clean Architecture de forma profesional, te recomiendo dividir el proyecto en 4 capas concéntricas:\n\n1. **Domain (`domain/`)**: Contiene las entidades puras...\n2. **Application (`application/`)**: Orquesta los casos de uso...",
     "selected_candidate": null,
+    "active_skill": "code-architect",
+    "mcp_tool_calls": [],
     "created_at": "2026-10-19T10:25:08Z",
     "attachments": []
   }
@@ -357,7 +374,7 @@ Envía un mensaje del usuario (con texto y/o archivos multimodales), procesa los
 
 ### 3.4 Selección de Respuesta en Modo A/B y Preferencias
 
-#### `POST /api/messages/{message_id}/select-candidate`
+#### `POST /api/messages/{message_id}/select-candidate` (y alias `/api/messages/{message_id}/select-ab`)
 Registra la elección del usuario entre la **Respuesta A** (concisa) y la **Respuesta B** (detallada) en un mensaje con `is_ab_test = true`.
 
 - **Request Body (`application/json`)**:
@@ -368,16 +385,6 @@ Registra la elección del usuario entre la **Respuesta A** (concisa) y la **Resp
 ```
 *(Valores permitidos: `"A"` o `"B"`).*
 
-- **Acciones Internas**:
-  1. Verifica que `messages.id == message_id` exista y tenga `is_ab_test == True`.
-  2. Actualiza `messages.selected_candidate = "A"` (o `"B"`).
-  3. Actualiza `messages.content = messages.candidate_a` (si eligió `"A"`) o `messages.candidate_b` (si eligió `"B"`).
-  4. Inserta un nuevo registro en `user_preferences`:
-     - `id`: UUID v4
-     - `preferred_style`: `"concise"` si `selected_candidate == "A"`, o `"detailed"` si `selected_candidate == "B"`.
-     - `message_id`: `message_id`
-     - `created_at`: UTC timestamp actual.
-
 - **Response `200 OK`**:
 ```json
 {
@@ -385,7 +392,7 @@ Registra la elección del usuario entre la **Respuesta A** (concisa) y la **Resp
     "id": "msg-ai-003",
     "chat_id": "550e8400-e29b-41d4-a716-446655440000",
     "role": "assistant",
-    "content": "Usa una estructura de 4 capas: `domain/` (entidades), `application/` (casos de uso), `infrastructure/` (SQLAlchemy/Ollama) y `presentation/` (rutas FastAPI).",
+    "content": "Usa una estructura de 4 capas...",
     "follow_up_options": [
       "¿Qué archivos van dentro de la carpeta domain?",
       "Dame un ejemplo de repositorio en infrastructure",
@@ -395,6 +402,8 @@ Registra la elección del usuario entre la **Respuesta A** (concisa) y la **Resp
     "candidate_a": "Usa una estructura de 4 capas...",
     "candidate_b": "Para estructurar un proyecto Python...",
     "selected_candidate": "A",
+    "active_skill": "code-architect",
+    "mcp_tool_calls": [],
     "created_at": "2026-10-19T10:25:08Z",
     "attachments": []
   },
@@ -419,3 +428,154 @@ Devuelve el resumen estadístico de preferencias del usuario para mostrar en la 
   "dominant_style": "concise"
 }
 ```
+
+---
+
+### 3.5 Gestión de Skills (`SKILL.md`) y Herramientas MCP (v2.0)
+
+#### `GET /api/skills`
+Lista todas las Skills disponibles en `backend/skills/<skill_id>/SKILL.md`.
+
+- **Response `200 OK`**:
+```json
+{
+  "skills": [
+    {
+      "id": "code-architect",
+      "name": "Arquitecto de Software",
+      "description": "Experto en Clean Architecture, revisión de código, patrones de diseño y optimización.",
+      "icon": "Code2",
+      "category": "engineering",
+      "triggers": ["arquitectura", "código", "refactoriza", "solid", "patrón", "fastapi", "react"],
+      "instructions_preview": "Actúa como un Arquitecto de Software Principal..."
+    }
+  ]
+}
+```
+
+#### `POST /api/skills`
+Crea o actualiza un archivo `backend/skills/<skill_id>/SKILL.md` personalizado.
+
+- **Request Body (`application/json`)**:
+```json
+{
+  "id": "security-auditor",
+  "name": "Auditor de Ciberseguridad",
+  "description": "Analiza vulnerabilidades OWASP Top 10 y buenas prácticas de seguridad.",
+  "icon": "ShieldCheck",
+  "category": "security",
+  "triggers": ["seguridad", "owasp", "vulnerabilidad", "xss", "sql injection"],
+  "instructions": "Analiza el código o consulta desde la perspectiva de OWASP Top 10..."
+}
+```
+
+#### `GET /api/mcp/tools`
+Lista todas las herramientas registradas en el motor MCP local siguiendo el contrato estándar `tools/list` de Model Context Protocol.
+
+- **Response `200 OK`**:
+```json
+{
+  "tools": [
+    {
+      "name": "mcp_calculator",
+      "description": "Evalúa expresiones matemáticas, financieras y estadísticas con precisión exacta.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "expression": { "type": "string", "description": "Expresión matemática a evaluar" }
+        },
+        "required": ["expression"]
+      }
+    }
+  ]
+}
+```
+
+#### `POST /api/mcp/call`
+Ejecuta directamente una herramienta MCP (`tools/call`) con los argumentos proporcionados y devuelve su resultado estructurado y tiempo de ejecución.
+
+- **Request Body (`application/json`)**:
+```json
+{
+  "tool_name": "mcp_calculator",
+  "arguments": {
+    "expression": "sqrt(144) * 18.5"
+  }
+}
+```
+
+- **Response `200 OK`**:
+```json
+{
+  "tool_name": "mcp_calculator",
+  "arguments": { "expression": "sqrt(144) * 18.5" },
+  "status": "success",
+  "result": "222.0",
+  "duration_ms": 4
+}
+```
+
+---
+
+### 3.6 Inspección de la Arquitectura Agéntica LangGraph (v2.1)
+
+#### `GET /api/graph/schema`
+Devuelve el esquema vivo del `StateGraph` de **LangGraph** (`backend/services/langgraph_service.py`), incluyendo los nodos del flujo agéntico y el código **Mermaid** para visualización interactiva.
+
+- **Response `200 OK`**:
+```json
+{
+  "engine": "LangGraph StateGraph",
+  "version": "2.1.0",
+  "state_schema": "LocalGemGraphState",
+  "nodes": [
+    {
+      "id": "node_load_context",
+      "label": "Carga de Contexto y Preferencias",
+      "description": "Resuelve el modelo activo en Ollama, carga el estilo preferido del usuario y evalúa la condición de Test A/B."
+    },
+    {
+      "id": "node_skill_router",
+      "label": "Enrutador de Skills (SKILL.md)",
+      "description": "Detecta e inyecta habilidades especializadas por selección manual, comando slash o triggers léxicos."
+    },
+    {
+      "id": "node_mcp_executor",
+      "label": "Ejecutor Híbrido MCP",
+      "description": "Invoca herramientas locales del Model Context Protocol (Calculadora, SQLite, Reloj, Workspace, Wikipedia)."
+    },
+    {
+      "id": "node_vision_bridge",
+      "label": "Vision Bridge (2 Etapas)",
+      "description": "Extrae descripciones visuales con moondream:latest y conmuta la síntesis en español a llama3.2."
+    },
+    {
+      "id": "node_context_compactor",
+      "label": "Compactador de Contexto",
+      "description": "Resume historiales largos (>= 14 mensajes) para proteger la ventana de contexto y la memoria RAM."
+    },
+    {
+      "id": "node_prompt_builder",
+      "label": "Constructor de Prompt Multimodal",
+      "description": "Ensambla el System Prompt adaptativo, adjuntos multimodales, resultados MCP y anclaje de intención."
+    },
+    {
+      "id": "node_generate_standard",
+      "label": "Generador Estándar Ollama",
+      "description": "Ejecuta inferencia simple adaptada al estilo histórico del usuario (conciso o detallado)."
+    },
+    {
+      "id": "node_generate_ab",
+      "label": "Generador Dual A/B",
+      "description": "Genera en paralelo controlado Candidata A (concisa, temp 0.3) y Candidata B (detallada, temp 0.8)."
+    },
+    {
+      "id": "node_parse_and_fallback",
+      "label": "Parser Resiliente de Opciones",
+      "description": "Extrae ---FOLLOW_UP_OPTIONS--- con 3 niveles de fallback determinista garantizando 2 a 3 sugerencias."
+    }
+  ],
+  "mermaid": "flowchart TD\n  START((START)) --> node_load_context..."
+}
+```
+

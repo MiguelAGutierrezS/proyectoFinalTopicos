@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
@@ -17,7 +17,7 @@ class AttachmentBase(BaseModel):
     local_path: str = Field(..., min_length=1, description="Ruta en disco local dentro de uploads/")
     extracted_text: Optional[str] = Field(
         default="",
-        description="Texto extraído, transcripción de audio o metadatos de imagen",
+        description="Texto extraído, transcripción de audio o análisis visual Vision Bridge",
     )
 
 
@@ -33,12 +33,34 @@ class AttachmentResponse(AttachmentBase):
 
 
 # =====================================================================
-# 2. Esquemas de Opciones de Seguimiento y Comparación A/B (`messages`)
+# 2. Esquemas de Opciones de Seguimiento, Comparación A/B, Skills y MCP (`messages`)
 # =====================================================================
 
 MessageRole = Literal["user", "assistant", "system"]
 CandidateChoice = Literal["A", "B"]
 PreferredStyleType = Literal["concise", "detailed"]
+
+
+class MCPToolCallTrace(BaseModel):
+    """Traza de ejecución de una herramienta MCP durante un turno de conversación."""
+
+    tool_name: str = Field(..., description="Nombre de la herramienta MCP ejecutada")
+    arguments: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Argumentos enviados a la herramienta MCP",
+    )
+    status: Literal["success", "error"] = Field(
+        default="success",
+        description="Estado de la ejecución MCP",
+    )
+    result_preview: str = Field(
+        default="",
+        description="Resultado o resumen devuelto por la herramienta MCP",
+    )
+    duration_ms: int = Field(
+        default=0,
+        description="Tiempo de ejecución de la herramienta en milisegundos",
+    )
 
 
 class ABComparisonPair(BaseModel):
@@ -74,6 +96,14 @@ class MessageCreate(BaseModel):
         default=None,
         description="Modelo de Ollama a utilizar (opcional)",
     )
+    skill_id: Optional[str] = Field(
+        default=None,
+        description="ID de la Skill modular a activar ('auto', 'code-architect', etc.)",
+    )
+    enable_mcp: bool = Field(
+        default=True,
+        description="Si es True, habilita la ejecución de herramientas MCP locales",
+    )
 
 
 class MessageResponse(BaseModel):
@@ -103,6 +133,14 @@ class MessageResponse(BaseModel):
         default=None,
         description="Candidata seleccionada por el usuario ('A' o 'B')",
     )
+    active_skill: Optional[str] = Field(
+        default=None,
+        description="ID de la Skill aplicada en este mensaje (ej. 'code-architect')",
+    )
+    mcp_tool_calls: List[MCPToolCallTrace] = Field(
+        default_factory=list,
+        description="Lista de herramientas MCP ejecutadas en este turno",
+    )
     created_at: datetime = Field(..., description="Fecha y hora de creación UTC")
     attachments: List[AttachmentResponse] = Field(
         default_factory=list,
@@ -118,6 +156,15 @@ class MessageResponse(BaseModel):
             return []
         if isinstance(value, list):
             return [str(item).strip() for item in value if str(item).strip()]
+        return []
+
+    @field_validator("mcp_tool_calls", mode="before")
+    @classmethod
+    def ensure_mcp_calls_list(cls, value: object) -> List[Dict[str, Any]]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [item if isinstance(item, dict) else item.model_dump() for item in value]
         return []
 
 
@@ -215,7 +262,7 @@ class SendMessageResponse(BaseModel):
     )
     assistant_message: MessageResponse = Field(
         ...,
-        description="Respuesta generada por la IA con opciones de seguimiento y datos A/B",
+        description="Respuesta generada por la IA con opciones de seguimiento, datos A/B, Skill y trazas MCP",
     )
 
 
@@ -242,8 +289,6 @@ class SelectCandidateRequest(BaseModel):
                 detail="Debe especificar 'selected' o 'selected_candidate' con valor 'A' o 'B'.",
             )
         return val
-
-
 
 
 class UserPreferenceResponse(BaseModel):
@@ -303,3 +348,105 @@ class HealthResponse(BaseModel):
     ollama_reachable: bool = Field(default=False)
     active_model: str = Field(default="llama3.2:latest")
     available_models: List[str] = Field(default_factory=list)
+
+
+# =====================================================================
+# 6. Esquemas de Skills Modulares (`SKILL.md`) y Herramientas MCP (v2.0)
+# =====================================================================
+
+
+class SkillInfo(BaseModel):
+    """Información estructurada de una Skill modular cargada desde `backend/skills/<id>/SKILL.md`."""
+
+    id: str = Field(..., description="Identificador único de la Skill (ej. 'code-architect')")
+    name: str = Field(..., description="Nombre visible de la Skill")
+    description: str = Field(..., description="Descripción corta del propósito de la Skill")
+    icon: str = Field(default="Sparkles", description="Nombre del icono Lucide")
+    category: str = Field(default="general", description="Categoría de la Skill")
+    triggers: List[str] = Field(
+        default_factory=list,
+        description="Palabras clave para activación automática en modo Auto-Skill",
+    )
+    instructions: str = Field(
+        default="",
+        description="Cuerpo completo en Markdown con las directivas expertas de la Skill",
+    )
+    instructions_preview: str = Field(
+        default="",
+        description="Extracto resumido de las instrucciones de la Skill",
+    )
+
+
+class SkillCreateRequest(BaseModel):
+    """Payload para crear o actualizar una nueva Skill modular (`POST /api/skills`)."""
+
+    id: str = Field(..., min_length=2, max_length=60, description="Slug de la Skill (ej. 'security-auditor')")
+    name: str = Field(..., min_length=2, max_length=80, description="Nombre visible")
+    description: str = Field(..., min_length=5, max_length=250, description="Descripción corta")
+    icon: str = Field(default="Sparkles", description="Nombre del icono Lucide")
+    category: str = Field(default="custom", description="Categoría")
+    triggers: List[str] = Field(default_factory=list, description="Palabras clave disparadoras")
+    instructions: str = Field(..., min_length=10, description="Instrucciones Markdown de la Skill")
+
+
+class SkillsListResponse(BaseModel):
+    skills: List[SkillInfo] = Field(default_factory=list)
+
+
+class MCPToolDefinition(BaseModel):
+    """Definición estándar de una herramienta en el catálogo Model Context Protocol (`tools/list`)."""
+
+    name: str = Field(..., description="Nombre único de la herramienta MCP")
+    description: str = Field(..., description="Descripción de la funcionalidad de la herramienta")
+    input_schema: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="JSON Schema de los argumentos de entrada",
+    )
+
+
+class MCPToolsListResponse(BaseModel):
+    tools: List[MCPToolDefinition] = Field(default_factory=list)
+
+
+class MCPCallRequest(BaseModel):
+    """Payload para invocar manualmente una herramienta MCP (`POST /api/mcp/call`)."""
+
+    tool_name: str = Field(..., min_length=1, description="Nombre de la herramienta MCP a ejecutar")
+    arguments: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Diccionario de argumentos para la herramienta",
+    )
+
+
+class MCPCallResponse(BaseModel):
+    """Respuesta de la ejecución directa de una herramienta MCP (`tools/call`)."""
+
+    tool_name: str
+    arguments: Dict[str, Any] = Field(default_factory=dict)
+    status: Literal["success", "error"]
+    result: str
+    duration_ms: int
+
+
+# =====================================================================
+# 7. Esquemas de Inspección de la Arquitectura LangGraph (`GET /api/graph/schema`)
+# =====================================================================
+
+
+class GraphNodeSchema(BaseModel):
+    """Metadatos de un nodo del StateGraph de LangGraph."""
+
+    id: str = Field(..., description="Identificador del nodo en el StateGraph")
+    label: str = Field(..., description="Nombre legible del nodo")
+    description: str = Field(..., description="Responsabilidad única del nodo")
+
+
+class GraphSchemaResponse(BaseModel):
+    """Esquema de respuesta de `GET /api/graph/schema` (`specs/04-langgraph-architecture.md` §5)."""
+
+    engine: str = Field(default="LangGraph StateGraph")
+    version: str = Field(default="2.1.0")
+    state_schema: str = Field(default="LocalGemGraphState")
+    nodes: List[GraphNodeSchema] = Field(default_factory=list)
+    mermaid: str = Field(..., description="Definición Mermaid flowchart TD del StateGraph")
+

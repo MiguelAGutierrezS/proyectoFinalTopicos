@@ -62,21 +62,28 @@ def get_db() -> Generator[Session, None, None]:
 
 def init_db() -> None:
     """Importa los modelos ORM y crea automáticamente todas las tablas en localgem.db si no existen,
-    aplicando migración idempotente para columnas nuevas si la base de datos ya existía."""
+    aplicando migración idempotente para columnas nuevas (Context Compactor, Skills y MCP) si la BD ya existía."""
     import models  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
 
-    # Migración defensiva en SQLite para columnas de Context Compactor
     try:
         with engine.connect() as conn:
-            cursor = conn.exec_driver_sql("PRAGMA table_info(chats)").fetchall()
-            col_names = {row[1] for row in cursor}
-            if "context_summary" not in col_names:
+            # 1. Migración de tabla chats
+            chat_cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(chats)").fetchall()}
+            if "context_summary" not in chat_cols:
                 conn.exec_driver_sql("ALTER TABLE chats ADD COLUMN context_summary TEXT DEFAULT NULL")
-            if "compacted_up_to_index" not in col_names:
+            if "compacted_up_to_index" not in chat_cols:
                 conn.exec_driver_sql("ALTER TABLE chats ADD COLUMN compacted_up_to_index INTEGER DEFAULT NULL")
+
+            # 2. Migración de tabla messages (Skills v2.0 y trazas MCP v2.0)
+            msg_cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(messages)").fetchall()}
+            if "active_skill" not in msg_cols:
+                conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN active_skill TEXT DEFAULT NULL")
+            if "mcp_calls_json" not in msg_cols:
+                conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN mcp_calls_json TEXT NOT NULL DEFAULT '[]'")
+
             conn.commit()
     except Exception as exc:
         import logging
-        logging.getLogger("localgem.db").warning("Aviso durante migración de tabla chats: %s", exc)
+        logging.getLogger("localgem.db").warning("Aviso durante migración de base de datos: %s", exc)

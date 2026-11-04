@@ -18,7 +18,12 @@ from schemas import (
     ChatDetailResponse,
     ChatSummaryResponse,
     ChatUpdate,
+    GraphSchemaResponse,
     HealthResponse,
+    MCPCallRequest,
+    MCPCallResponse,
+    MCPToolDefinition,
+    MCPToolsListResponse,
     MessageResponse,
     ModelsListResponse,
     OllamaModelInfo,
@@ -26,8 +31,12 @@ from schemas import (
     SelectCandidateRequest,
     SelectCandidateResponse,
     SendMessageResponse,
+    SkillCreateRequest,
+    SkillInfo,
+    SkillsListResponse,
     UserPreferenceResponse,
 )
+from services.mcp_service import call_mcp_tool, list_mcp_tools
 from services.multimodal_processor import (
     BACKEND_DIR as PROCESSOR_BACKEND_DIR,
     UPLOADS_DIR,
@@ -40,7 +49,10 @@ from services.ollama_service import (
     generate_fallback_follow_up_options,
     get_user_style_preference,
     list_ollama_models,
+    select_preferred_default_model,
 )
+from services.skills_service import create_or_update_skill, list_skills
+from services.langgraph_service import get_graph_schema
 
 logging.basicConfig(
     level=logging.INFO,
@@ -61,7 +73,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="LocalGem Chat API",
     description="Backend 100% local y gratuito para LocalGem Chat con FastAPI, SQLite y Ollama.",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -110,7 +122,7 @@ async def health_check() -> HealthResponse:
     """Verifica la conexión con SQLite y el estado de Ollama en localhost:11434."""
     models_raw, reachable = await list_ollama_models()
     available_names = [m["name"] for m in models_raw]
-    active_model = available_names[0] if available_names else DEFAULT_FALLBACK_MODEL
+    active_model = select_preferred_default_model(available_names)
     return HealthResponse(
         status="ok",
         database="connected",
@@ -125,7 +137,8 @@ async def get_models() -> ModelsListResponse:
     """Lista los modelos instalados localmente en Ollama (`/api/tags`)."""
     models_raw, _ = await list_ollama_models()
     models_list = [OllamaModelInfo(**m) for m in models_raw]
-    default_model = models_list[0].name if models_list else DEFAULT_FALLBACK_MODEL
+    available_names = [m.name for m in models_list]
+    default_model = select_preferred_default_model(available_names)
     return ModelsListResponse(
         models=models_list,
         default_model=default_model,
@@ -212,7 +225,6 @@ def delete_chat(chat_id: str, db: Session = Depends(get_db)) -> ChatDeleteRespon
             detail=f"El chat con ID '{chat_id}' no existe.",
         )
 
-    # Recolectar rutas de archivos físicos para borrarlos del disco
     file_paths_to_remove: List[Path] = []
     for msg in chat.messages:
         for att in msg.attachments:
@@ -250,16 +262,18 @@ async def send_message(
     model: Optional[str] = Form(default=None),
     compare_mode: bool = Form(default=False),
     force_ab_test: bool = Form(default=False),
+    skill_id: Optional[str] = Form(default="auto"),
+    enable_mcp: bool = Form(default=True),
     files: Optional[List[UploadFile]] = File(default=None),
     db: Session = Depends(get_db),
 ) -> SendMessageResponse:
     """
-    Recibe `FormData` con `content`, `model`, `compare_mode` (o `force_ab_test`) y `files`.
-    1. Procesa localmente los archivos subidos (imágenes, PDFs/documentos, audios).
+    Recibe `FormData` con `content`, `model`, `compare_mode` (o `force_ab_test`), `skill_id`, `enable_mcp` y `files`.
+    1. Procesa localmente los archivos subidos (Vision Bridge para imágenes, PyMuPDF/CSV para documentos, faster-whisper para audios).
     2. Guarda el mensaje del usuario y sus registros `Attachment` en SQLite.
     3. Autogenera el título del chat si es el primer mensaje.
-    4. Llama a `ollama_service.generate_assistant_reply` (activando el modo A/B cada 3 mensajes o si `compare_mode=True`).
-    5. Persiste y devuelve el mensaje del usuario y la respuesta del asistente con sus `follow_up_options`.
+    4. Llama a `ollama_service.generate_assistant_reply` (resolviendo Skills, ejecutando MCP y activando el modo A/B si corresponde).
+    5. Persiste y devuelve el mensaje del usuario y la respuesta del asistente con sus `follow_up_options`, `active_skill` y `mcp_tool_calls`.
     """
     chat = db.query(Chat).filter(Chat.id == chat_id).first()
     if not chat:
@@ -275,13 +289,12 @@ async def send_message(
             detail="Debes enviar un mensaje de texto o al menos un archivo adjunto.",
         )
 
-    # Historial previo antes de insertar el nuevo mensaje
     previous_messages: List[Message] = list(chat.messages)
 
-    # 1. Procesar archivos multimodales subidos
+    # 1. Procesar archivos multimodales subidos (incluye Vision Bridge en imágenes)
     processed_attachments: List[ProcessedAttachment] = []
     for upload in valid_uploads:
-        processed = await process_uploaded_file(upload)
+        processed = await process_uploaded_file(upload, preferred_model=model)
         processed_attachments.append(processed)
 
     # 2. Crear y guardar el mensaje del usuario
@@ -330,7 +343,7 @@ async def send_message(
     db.commit()
     db.refresh(user_msg)
 
-    # 4. Invocar al orquestador de Ollama (Modo normal o Modo de Satisfacción A/B)
+    # 4. Invocar al orquestador de Ollama (Vision Bridge + Skills + MCP + Modo A/B)
     should_compare = bool(compare_mode or force_ab_test)
     orchestration = await generate_assistant_reply(
         db=db,
@@ -341,7 +354,13 @@ async def send_message(
         requested_model=model,
         compare_mode=should_compare,
         chat=chat,
+        skill_id=skill_id,
+        enable_mcp=enable_mcp,
     )
+
+    # Actualizar active_skill en el mensaje del usuario también para trazabilidad
+    if orchestration.active_skill:
+        user_msg.active_skill = orchestration.active_skill
 
     # 5. Guardar la respuesta del asistente en SQLite
     assistant_msg = Message(
@@ -352,8 +371,10 @@ async def send_message(
         candidate_a=orchestration.candidate_a,
         candidate_b=orchestration.candidate_b,
         selected_candidate=None,
+        active_skill=orchestration.active_skill,
     )
     assistant_msg.follow_up_options = orchestration.follow_up_options
+    assistant_msg.mcp_tool_calls = orchestration.mcp_tool_calls
 
     chat.updated_at = datetime.now(timezone.utc)
     db.add(assistant_msg)
@@ -406,7 +427,6 @@ def _handle_ab_selection(
     msg.selected_candidate = chosen
     msg.content = winning_text
 
-    # Asegurar que el mensaje tenga siempre sus 3 opciones de seguimiento listas
     if len(msg.follow_up_options) < 2:
         msg.follow_up_options = generate_fallback_follow_up_options(
             user_prompt=winning_text[:200],
@@ -474,6 +494,116 @@ def get_preferences_summary(db: Session = Depends(get_db)) -> PreferenceSummaryR
     """Devuelve el resumen estadístico de preferencias A/B del usuario."""
     summary = get_user_style_preference(db)
     return PreferenceSummaryResponse(**summary)
+
+
+# =====================================================================
+# 5. Endpoints de Skills (`SKILL.md`) y Herramientas MCP Locales
+# =====================================================================
+
+
+@app.get("/api/skills", response_model=SkillsListResponse, tags=["Skills"])
+def get_skills_endpoint() -> SkillsListResponse:
+    """
+    Escanea `backend/skills/*/SKILL.md`, parsea su YAML frontmatter e instrucciones
+    y devuelve el catálogo de Skills instaladas (specs/02-database-and-api.md §3.5.1).
+    """
+    skills_raw = list_skills()
+    items = [
+        SkillInfo(
+            id=s.id,
+            name=s.name,
+            description=s.description,
+            icon=s.icon,
+            category=s.category,
+            triggers=s.triggers,
+            instructions=s.instructions,
+            instructions_preview=s.instructions_preview,
+        )
+        for s in skills_raw
+    ]
+    return SkillsListResponse(skills=items)
+
+
+@app.post(
+    "/api/skills",
+    response_model=SkillInfo,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Skills"],
+)
+def create_skill_endpoint(payload: SkillCreateRequest) -> SkillInfo:
+    """
+    Crea o actualiza en caliente un archivo `backend/skills/{id}/SKILL.md`
+    sin necesidad de reiniciar el servidor FastAPI (specs/02-database-and-api.md §3.5.2).
+    """
+    try:
+        created = create_or_update_skill(
+            skill_id=payload.id,
+            name=payload.name,
+            description=payload.description,
+            icon=payload.icon,
+            category=payload.category,
+            triggers=payload.triggers,
+            instructions=payload.instructions,
+        )
+        return SkillInfo(
+            id=created.id,
+            name=created.name,
+            description=created.description,
+            icon=created.icon,
+            category=created.category,
+            triggers=created.triggers,
+            instructions=created.instructions,
+            instructions_preview=created.instructions_preview,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+
+@app.get("/api/mcp/tools", response_model=MCPToolsListResponse, tags=["MCP"])
+def get_mcp_tools_endpoint() -> MCPToolsListResponse:
+    """
+    Devuelve las herramientas locales registradas en el servidor MCP de LocalGem Chat
+    junto con su `input_schema` (JSON Schema) (specs/02-database-and-api.md §3.5.3).
+    """
+    tools_raw = list_mcp_tools()
+    return MCPToolsListResponse(
+        tools=[MCPToolDefinition(**t) for t in tools_raw],
+    )
+
+
+@app.post("/api/mcp/call", response_model=MCPCallResponse, tags=["MCP"])
+async def call_mcp_tool_endpoint(payload: MCPCallRequest) -> MCPCallResponse:
+    """
+    Ejecuta directamente una herramienta MCP local (para pruebas o panel de inspección en UI)
+    y devuelve su salida y tiempo de ejecución en milisegundos (specs/02-database-and-api.md §3.5.4).
+    """
+    trace = await call_mcp_tool(tool_name=payload.tool_name, arguments=payload.arguments)
+    return MCPCallResponse(
+        tool_name=trace["tool_name"],
+        arguments=trace["arguments"],
+        status=trace["status"],
+        result=trace["result"],
+        duration_ms=trace["duration_ms"],
+    )
+
+
+# =====================================================================
+# 6. Endpoint de Inspección de la Arquitectura LangGraph (`GET /api/graph/schema`)
+# =====================================================================
+
+
+@app.get("/api/graph/schema", response_model=GraphSchemaResponse, tags=["LangGraph"])
+def get_langgraph_schema_endpoint() -> GraphSchemaResponse:
+    """
+    Devuelve la estructura viva del `StateGraph` de LangGraph, incluyendo los 9 nodos
+    y el diagrama Mermaid (`specs/04-langgraph-architecture.md` §5).
+    """
+    schema_dict = get_graph_schema()
+    return GraphSchemaResponse(**schema_dict)
+
 
 
 if __name__ == "__main__":
